@@ -1,0 +1,5 @@
+# local credentials snapshots — never commit
+accounts/
+# local session history
+sessions/
+.DS_Store
