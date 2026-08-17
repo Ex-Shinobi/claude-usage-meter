@@ -1,5 +1,7 @@
-# local credentials snapshots — never commit
+# Credential snapshots and session history now live outside the repo, in
+# ~/.config/claude-usage-meter — see README "Security". These two entries stay
+# as a backstop for anyone upgrading from the version that kept them in-tree.
 accounts/
-# local session history
 sessions/
+*.tmp-*
 .DS_Store

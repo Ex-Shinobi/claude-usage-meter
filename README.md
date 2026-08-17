@@ -6,7 +6,7 @@ terminal (Session 5h, Weekly, per-model caps, extra usage) — in two places:
 - **Localhost page** (`server.js`): one card per account with usage bars.
 - **macOS menu bar** (SwiftBar plugin): live per-account percentages at a glance.
 
-Read-only: it never changes your login or writes to your credentials.
+Read-only: it never changes your login or writes to your Claude Code credentials.
 
 ## Requirements
 
@@ -29,7 +29,14 @@ Read-only: it never changes your login or writes to your credentials.
 
    ```bash
    node server.js
-   # open http://127.0.0.1:4177
+   ```
+
+   On first run it creates its state directory and prints a URL with a one-time
+   token. Open that URL — it sets a cookie for your browser, then plain
+   `http://127.0.0.1:4177` works from then on. To authorize a browser later:
+
+   ```bash
+   open "http://127.0.0.1:4177/?t=$(cat ~/.config/claude-usage-meter/token)"
    ```
 
    To keep it running permanently, create a LaunchAgent at
@@ -56,7 +63,8 @@ Read-only: it never changes your login or writes to your credentials.
 
 3. **Menu bar (optional):** open SwiftBar and set its plugin folder to this
    repo's `menubar/` directory (or copy `menubar/claude-usage.5m.py` into your
-   existing SwiftBar plugin folder). It refreshes every 5 minutes.
+   existing SwiftBar plugin folder). It refreshes every 5 minutes and reads the
+   API token itself, so there's nothing to configure.
 
 4. **Session tracking (optional):** to have the meter show which terminal each
    Claude Code session runs in, add `record-session.sh` as a `SessionStart` hook
@@ -82,11 +90,64 @@ red ≥95%), with segmented bars and reset times in the dropdown.
 ## How it reads usage
 
 - Active account: token from the macOS Keychain (`Claude Code-credentials`).
-- Other saved accounts: their snapshot in `accounts/` (token refreshed as needed).
-  With a single account, only the Keychain is used — `accounts/` stays empty.
+- Other saved accounts: their snapshot in the state dir (token refreshed as
+  needed). With a single account, only the Keychain is used and no snapshots
+  are needed at all.
 
-Nothing is ever written to your credentials. Calls are on-demand only (open +
-refresh), so it stays well under the usage endpoint's rate limit.
+Nothing is ever written to your Claude Code credentials. Calls are on-demand only
+(open + refresh), so it stays well under the usage endpoint's rate limit.
 
-> **Note:** `accounts/` and `sessions/` hold your local credentials snapshots and
-> session history. They are gitignored — never commit or share them.
+## Security
+
+**This tool is single-machine, single-user. Nothing here is shareable — the
+state directory holds credentials equivalent to a full Claude login.**
+
+### Where state lives
+
+Everything the meter stores is kept **outside this repo**, in
+`~/.config/claude-usage-meter` (override with `$CLAUDE_USAGE_HOME`; respects
+`$XDG_CONFIG_HOME`). Directories are `0700`, files `0600`:
+
+| Path | Contents |
+| --- | --- |
+| `accounts/*.json` | Per-account snapshots, including **OAuth refresh tokens** |
+| `sessions/*.json` | One record per live session: your email + working directory |
+| `token` | The local API token |
+
+Credential snapshots deliberately do **not** live in the checkout. A refresh
+token is a long-lived, full-account credential; one stray `git add -f`, one
+edited `.gitignore`, or one "zip up this folder and send it" would leak all of
+them. If you're upgrading from a version that kept `accounts/` and `sessions/`
+inside the repo, the server moves them on first start (copy, verify, then
+remove — a failure leaves the originals untouched).
+
+### How the server is protected
+
+The server binds to `127.0.0.1` only — it is never reachable from the network.
+On top of that:
+
+- **Every request needs the API token**, presented as `Authorization: Bearer`,
+  `?t=`, or the cookie the first tokenized visit sets. The token file is `0600`,
+  so other accounts on this Mac can't read your usage or session list off the
+  port. The token is only ever printed to a terminal, never to a log file.
+- **Host allowlist.** A request whose `Host` isn't loopback is rejected, which
+  is what defeats DNS rebinding: a page on `evil.com` that re-resolves to
+  `127.0.0.1` still sends `Host: evil.com`.
+- **Cross-site requests are rejected** via `Sec-Fetch-Site`/`Origin`, so a
+  website you happen to be visiting can't fire `<img src="…/api/usage?force=1">`
+  at the server. Following a link to the page still works — only sub-resource
+  requests are blocked.
+- **No token or credential is ever in a response body**, and error strings have
+  filesystem paths stripped out.
+- The page ships a nonce-based CSP with `default-src 'none'`; every value from
+  the usage API or from disk is escaped before it reaches the DOM.
+
+To rotate the API token, delete `~/.config/claude-usage-meter/token` and restart
+the server. Browsers will need re-authorizing with the `?t=` URL.
+
+### What this does not protect against
+
+Any process running **as you** can read the token file — but it could equally
+read `~/.claude/.credentials.json` directly, so that isn't a boundary this tool
+can create. The protections above are against other accounts on the machine,
+other machines on the network, and websites you visit.

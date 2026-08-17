@@ -13,9 +13,26 @@ from datetime import datetime
 
 BASE = "http://127.0.0.1:4177"
 
-def get(url, t=10):
+# The server's API is token-gated so that other accounts on this Mac can't read
+# it off the port. The token file is 0600 in the state dir, outside the repo.
+STATE = os.environ.get("CLAUDE_USAGE_HOME") or os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "claude-usage-meter")
+
+def read_token():
     try:
-        with urllib.request.urlopen(url, timeout=t) as r:
+        with open(os.path.join(STATE, "token")) as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
+TOKEN = read_token()
+
+def get(url, t=10):
+    req = urllib.request.Request(url)
+    if TOKEN:
+        req.add_header("Authorization", "Bearer " + TOKEN)
+    try:
+        with urllib.request.urlopen(req, timeout=t) as r:
             return json.load(r)
     except Exception:
         return None
@@ -131,7 +148,11 @@ state = get(BASE + "/api/state", 4)
 if not state:
     print("CC ⚠")
     print("---")
-    print("Usage server not running")
+    if TOKEN is None:
+        print("No API token at " + os.path.join(STATE, "token"))
+        print("Start the server once to create it | font=Menlo size=12 color=#8b93a7")
+    else:
+        print("Usage server not running")
     print("Open folder | bash=/usr/bin/open param1=" + os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + " terminal=false")
     raise SystemExit
 
@@ -199,4 +220,7 @@ for a in accounts:
     print("---")
 
 print("Refresh now | refresh=true")
-print(BASE.replace("http://", "") + " | href=" + BASE + " size=11 color=#8b93a7")
+# carry the token so the first click authorizes the browser; the server then
+# sets a cookie and redirects to the bare URL
+link = BASE + ("/?t=" + TOKEN if TOKEN else "")
+print(BASE.replace("http://", "") + " | href=" + link + " size=11 color=#8b93a7")
