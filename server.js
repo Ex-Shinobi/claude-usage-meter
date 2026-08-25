@@ -152,6 +152,88 @@ function listAccounts() {
   return rows.sort((x, y) => (x.active === y.active ? (x.label || "").localeCompare(y.label || "") : (x.active ? -1 : 1)));
 }
 
+// ---------- account capture & switching ----------
+// The live Keychain blob is the only copy of an account's *current* refresh
+// token: Anthropic rotates it on every redemption, so a snapshot taken once is
+// dead the moment the running CLI refreshes. That is exactly how the saved
+// accounts here went stale. Copy the live credentials back into the active
+// account's snapshot as we go, so switching away never strands a dead token.
+function slugFor(email) {
+  return String(email || "").trim().toLowerCase().replace(/@/g, "-").replace(/[^a-z0-9._-]/g, "_");
+}
+let lastCapture = 0;
+function captureActive(force) {
+  if (!force && Date.now() - lastCapture < 30000) return null;
+  lastCapture = Date.now();
+  try {
+    const kc = keychainRead();
+    if (!kc || !kc.claudeAiOauth || !kc.claudeAiOauth.accessToken) return null;
+    const id = currentIdentity();
+    const email = (id.oauthAccount && id.oauthAccount.emailAddress) || null;
+    const row = listAccounts().find((a) => a.active);
+    const slug = (row && row.slug) || (email ? slugFor(email) : null);
+    if (!slug) return null;
+    let prev = {}; try { prev = loadSnapshot(slug); } catch (_) {}
+    const cur = prev.claudeAiOauth || {};
+    if (cur.accessToken === kc.claudeAiOauth.accessToken &&
+        cur.refreshToken === kc.claudeAiOauth.refreshToken) return slug;   // nothing moved
+    saveSnapshot(slug, { ...prev, claudeAiOauth: kc.claudeAiOauth,
+      oauthAccount: id.oauthAccount || prev.oauthAccount || null,
+      email: email || prev.email || null, label: prev.label || email || slug,
+      capturedAt: Date.now() });
+    return slug;
+  } catch (_) { return null; }
+}
+
+// The Keychain item also carries mcpOAuth — every MCP connector you have
+// logged into. Those are machine-scoped, not account-scoped, so a switch
+// replaces claudeAiOauth only and leaves the rest of the blob untouched.
+function keychainWrite(oauth) {
+  const blob = keychainRead() || {};
+  blob.claudeAiOauth = oauth;
+  // `security` takes the secret as an argv value and has no stdin form of
+  // add-generic-password; it is briefly visible to this user's own processes.
+  execFileSync("security", ["add-generic-password", "-U", "-s", KC_SERVICE, "-a", KC_ACCOUNT,
+    "-w", JSON.stringify(blob)], { stdio: ["ignore", "ignore", "pipe"] });
+}
+// ~/.claude.json is 300KB of unrelated config that running sessions also write.
+// Touch the one identity key, atomically, and keep the file's own mode.
+function writeIdentity(oauthAccount) {
+  if (!oauthAccount) return false;
+  const j = readJson(CLAUDE_JSON);
+  j.oauthAccount = oauthAccount;
+  let mode = 0o644; try { mode = fs.statSync(CLAUDE_JSON).mode & 0o777; } catch (_) {}
+  const tmp = CLAUDE_JSON + ".tmp-" + process.pid;
+  fs.writeFileSync(tmp, JSON.stringify(j), { mode });
+  fs.renameSync(tmp, CLAUDE_JSON);
+  return true;
+}
+
+// Running sessions re-read the Keychain on their own (Claude Code caches the
+// read briefly, then shells out to `security` again), so a switch reaches every
+// live session without restarting anything — that is the "apply all".
+async function switchTo(slug) {
+  const target = listAccounts().find((a) => a.slug === slug);
+  if (!target) throw new Error("unknown account");
+  const sessions = listSessions().length;
+  if (target.active) return { already: true, active: target.label, sessions };
+
+  captureActive(true);                        // bank the outgoing account first
+  let snap = loadSnapshot(slug);
+  if (!snap || !snap.claudeAiOauth || !snap.claudeAiOauth.accessToken)
+    throw new Error("no saved credentials for that account");
+  const exp = snap.claudeAiOauth.expiresAt;
+  if (exp && exp < Date.now() + 120000) {
+    await refreshSnapshot(slug);              // throws if the refresh token is dead
+    snap = loadSnapshot(slug);
+  }
+  keychainWrite(snap.claudeAiOauth);
+  const identity = writeIdentity(snap.oauthAccount);
+  usageCache.clear();                          // active flags just moved
+  lastCapture = Date.now();                    // don't recapture over the switch
+  return { active: target.label, identity, sessions };
+}
+
 // ---------- live sessions ----------
 // Shows EVERY interactive Claude Code session that's running (from the process
 // list), and overlays the account recorded by the SessionStart hook. Sessions
@@ -205,6 +287,12 @@ function listSessions() {
 // ---------- usage (cached; fetched on open + on manual refresh) ----------
 const usageCache = new Map();
 let cooldownUntil = 0;
+// Anthropic's retry-after on a 429 can be an hour. Honoring it verbatim froze the
+// whole meter — every account served days-old numbers with no way to force past it.
+// Cap the backoff, clear it the moment anything succeeds, and stop refetching an
+// account whose numbers are still fresh, which is what tripped the 429 to begin with.
+const COOLDOWN_MAX_MS = 5 * 60 * 1000;
+const FORCE_MIN_AGE_MS = 4 * 60 * 1000;
 
 // Anthropic rotates the refresh token every time one is redeemed, so two
 // concurrent refreshes of the same account leave one snapshot holding a dead
@@ -238,10 +326,13 @@ async function rawFetchUsage(accessToken) {
       "anthropic-version": "2023-06-01", "User-Agent": "claude-usage-meter/1.0", "Accept": "application/json" },
     signal: AbortSignal.timeout(12000),
   });
-  if (r.status === 429) { cooldownUntil = Date.now() + (Number(r.headers.get("retry-after")) || 90) * 1000;
+  if (r.status === 429) {
+    const ra = Number(r.headers.get("retry-after"));
+    cooldownUntil = Date.now() + Math.min((ra > 0 ? ra : 90) * 1000, COOLDOWN_MAX_MS);
     const e = new Error("rate limited — try again shortly"); e.code = 429; throw e; }
   if (r.status === 401) return { unauth: true };
   if (!r.ok) throw new Error("usage HTTP " + r.status);
+  cooldownUntil = 0;                       // upstream is answering again
   return { usage: shapeUsage(await r.json()) };
 }
 function refreshSnapshot(slug) {
@@ -292,7 +383,8 @@ function fetchAndCache(slug) {
 }
 async function getUsage(slug, force) {
   const c = usageCache.get(slug);
-  if (!force && c) return { ...c.data, stale: false, fetchedAt: c.at };
+  if (c && (!force || Date.now() - c.at < FORCE_MIN_AGE_MS))
+    return { ...c.data, stale: false, fetchedAt: c.at };
   try { const data = await fetchAndCache(slug); return { ...data, stale: false, fetchedAt: Date.now() }; }
   catch (e) { if (c) return { ...c.data, stale: true, fetchedAt: c.at, note: safeErr(e) }; throw e; }
 }
@@ -405,7 +497,16 @@ const server = http.createServer(async (req, res) => {
 
     if (!authed) return send(res, 401, { ok: false, error: "unauthorized" });
 
-    if (req.method === "GET" && url.pathname === "/api/state") { return send(res, 200, { currentEmail: currentEmail(), accounts: listAccounts() }); }
+    if (req.method === "GET" && url.pathname === "/api/state") {
+      captureActive(false);
+      return send(res, 200, { currentEmail: currentEmail(), accounts: listAccounts() });
+    }
+    if (req.method === "POST" && url.pathname === "/api/switch") {
+      const slug = url.searchParams.get("slug");
+      if (!slug) return send(res, 400, { ok: false, error: "missing slug" });
+      try { return send(res, 200, { ok: true, ...(await switchTo(slug)) }); }
+      catch (e) { console.error("switch " + slug + ":", e); return send(res, 200, { ok: false, error: safeErr(e) }); }
+    }
     if (req.method === "GET" && url.pathname === "/api/sessions") { return send(res, 200, { sessions: listSessions() }); }
     if (req.method === "GET" && url.pathname === "/api/usage") {
       const slug = url.searchParams.get("slug"); const force = url.searchParams.get("force") === "1";

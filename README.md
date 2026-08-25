@@ -85,7 +85,27 @@ logged in as is marked **active**. Usage loads when you open the page; click
 **↻ Refresh** (top-right, or per-card) to pull fresh numbers.
 
 The menu bar shows one colored dot + percentage per account (green / yellow ≥80% /
-red ≥95%), with segmented bars and reset times in the dropdown.
+red ≥95%), with segmented bars and reset times (with the date) in the dropdown.
+When the server can't reach the usage endpoint it keeps showing its last good
+numbers, marked `⚠ cached 2d ago` so old figures can't pass for current ones.
+
+## Switching accounts
+
+Each non-active account in the dropdown has a **⇄ Switch to this account** item.
+Clicking it swaps the active Claude Code login, and **every running `claude`
+session picks it up within about a minute — nothing needs restarting.** That
+works because Claude Code re-reads its credentials from the Keychain on a short
+cache rather than holding them for the life of the process.
+
+The switch replaces `claudeAiOauth` in the Keychain item and the `oauthAccount`
+key in `~/.claude.json`. It deliberately leaves the rest of the Keychain blob
+alone — `mcpOAuth` holds your MCP connector logins, which are machine-scoped,
+not account-scoped, and swapping them out would sign you out of all of them.
+
+An account can only be switched to if its snapshot still has a working refresh
+token. If the refresh is rejected (`refresh HTTP 400`), the switch is refused
+**before** anything is written, so a dead account can never corrupt your live
+credentials — you just need to `/login` as that account once to revive it.
 
 ## How it reads usage
 
@@ -94,8 +114,20 @@ red ≥95%), with segmented bars and reset times in the dropdown.
   needed). With a single account, only the Keychain is used and no snapshots
   are needed at all.
 
-Nothing is ever written to your Claude Code credentials. Calls are on-demand only
-(open + refresh), so it stays well under the usage endpoint's rate limit.
+Reads are on-demand (open + refresh) and an account whose numbers are under four
+minutes old is served from cache, which keeps this under the usage endpoint's
+rate limit. On a 429 the backoff is capped at five minutes and cleared as soon as
+a call succeeds — honoring the endpoint's own hour-long `retry-after` used to
+freeze every account behind days-old numbers.
+
+Credentials are written in exactly two cases:
+
+- **Switching accounts**, on your click (see above).
+- **Capturing the active account.** Anthropic rotates the refresh token on every
+  redemption, so a snapshot taken once is dead the moment the running CLI
+  refreshes. The server copies the live Keychain credentials back into the active
+  account's snapshot as it goes, so the account you switch *away* from is still
+  usable when you switch back. Without this, saved accounts quietly rot.
 
 ## Security
 

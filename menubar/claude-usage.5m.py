@@ -51,9 +51,22 @@ def when(rs):
         return ""
     try:
         d = datetime.fromisoformat(rs.replace("Z", "+00:00")).astimezone()
-        return "resets " + d.strftime("%a %-I:%M %p")
+        return "resets " + d.strftime("%a %-m/%-d %-I:%M %p")
     except Exception:
         return ""
+
+def ago(ms):
+    """'2d ago' for a fetchedAt epoch-ms, so cached numbers can't pass as live."""
+    if not ms:
+        return "unknown age"
+    sec = max(0, time.time() - ms / 1000.0)
+    if sec < 90:
+        return "just now"
+    if sec < 5400:
+        return str(int(round(sec / 60))) + "m ago"
+    if sec < 129600:
+        return str(int(round(sec / 3600))) + "h ago"
+    return str(int(round(sec / 86400))) + "d ago"
 
 def segbar(p):
     p = max(0, min(100, p))
@@ -144,6 +157,8 @@ def title_image(parts):
     img.save(buf, format="PNG", dpi=(72 * S, 72 * S))  # 144dpi => macOS lays it out at 1/2 pixel size
     return base64.b64encode(buf.getvalue()).decode()
 
+SWITCH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "switch-account.sh")
+
 state = get(BASE + "/api/state", 4)
 if not state:
     print("CC ⚠")
@@ -194,6 +209,12 @@ for a in accounts:
     name = (a.get("label") or a.get("email") or a["slug"]) + (" active" if a.get("active") else "")
     print(name + " | size=14")
     if u and u.get("ok"):
+        # The server serves its last good numbers when a live fetch fails, so say
+        # so — otherwise days-old percentages and reset times read as current.
+        if u.get("stale"):
+            why = str(u.get("note") or "fetch failed")
+            print("  \u26a0 cached " + ago(u.get("fetchedAt")) + " \u00b7 " + why +
+                  " | font=Menlo size=11 color=#8b93a7")
         rows = [("Session 5h", u.get("fiveHour"), u.get("fiveHourResets")),
                 ("Weekly    ", u.get("sevenDay"), u.get("sevenDayResets"))]
         for l in (u.get("limits") or []):
@@ -217,6 +238,11 @@ for a in accounts:
     else:
         err = (u or {}).get("error", "")
         print("  usage unavailable" + ((" (" + err + ")") if err else "") + " | font=Menlo size=12 color=#8b93a7")
+    # Switching is a Keychain write; every running session re-reads it within
+    # about a minute, so one click moves them all — no restarts, no re-login.
+    if not a.get("active"):
+        print("  \u21c4 Switch to this account | bash=" + SWITCH + " param1=" + a["slug"] +
+              " terminal=false refresh=true font=Menlo size=11")
     print("---")
 
 print("Refresh now | refresh=true")
