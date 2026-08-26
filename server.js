@@ -134,6 +134,16 @@ function saveSnapshot(slug, snap) {
   fs.writeFileSync(tmp, JSON.stringify(snap), { mode: 0o600 });
   fs.renameSync(tmp, path.join(ACCT_DIR, slug + ".json"));
 }
+// Remember that an account needs a browser login, so the meter can say so
+// instead of retrying a credential Anthropic has already refused.
+function markLogin(slug, needs) {
+  try {
+    const snap = loadSnapshot(slug);
+    if (!snap || !!snap.needsLogin === !!needs) return;
+    if (needs) snap.needsLogin = true; else delete snap.needsLogin;
+    saveSnapshot(slug, snap);
+  } catch (_) {}
+}
 function listAccounts() {
   let files = [];
   try { files = fs.readdirSync(ACCT_DIR).filter((f) => f.endsWith(".json")); } catch (_) {}
@@ -286,7 +296,10 @@ function listSessions() {
 
 // ---------- usage (cached; fetched on open + on manual refresh) ----------
 const usageCache = new Map();
-let cooldownUntil = 0;
+// Per account, not global: a dead account earns an auth-failure 429 from
+// Anthropic, and a shared cooldown let that 429 silence the account you are
+// actually logged in as.
+const cooldowns = new Map();
 // Anthropic's retry-after on a 429 can be an hour. Honoring it verbatim froze the
 // whole meter — every account served days-old numbers with no way to force past it.
 // Cap the backoff, clear it the moment anything succeeds, and stop refetching an
@@ -328,11 +341,11 @@ async function rawFetchUsage(accessToken) {
   });
   if (r.status === 429) {
     const ra = Number(r.headers.get("retry-after"));
-    cooldownUntil = Date.now() + Math.min((ra > 0 ? ra : 90) * 1000, COOLDOWN_MAX_MS);
-    const e = new Error("rate limited — try again shortly"); e.code = 429; throw e; }
+    const e = new Error("rate limited — try again shortly"); e.code = 429;
+    e.retryAfterMs = Math.min((ra > 0 ? ra : 90) * 1000, COOLDOWN_MAX_MS);
+    throw e; }
   if (r.status === 401) return { unauth: true };
   if (!r.ok) throw new Error("usage HTTP " + r.status);
-  cooldownUntil = 0;                       // upstream is answering again
   return { usage: shapeUsage(await r.json()) };
 }
 function refreshSnapshot(slug) {
@@ -371,14 +384,29 @@ function fetchAndCache(slug) {
   return once("usage:" + slug, async () => {
     const meta = listAccounts().find((a) => a.slug === slug);
     if (!meta) throw new Error("unknown account");
-    if (Date.now() < cooldownUntil) { const e = new Error("cooling down"); e.code = 429; throw e; }
-    let { tok, canRefresh } = await tokenForAccount(slug, meta);
-    let res = await rawFetchUsage(tok);
-    if (res.unauth && canRefresh) { tok = await refreshSnapshot(slug); res = await rawFetchUsage(tok); }
-    if (res.unauth) throw new Error("login expired");
-    const data = { active: meta.active, ...res.usage };
-    usageCache.set(slug, { at: Date.now(), data });
-    return data;
+    if (Date.now() < (cooldowns.get(slug) || 0)) { const e = new Error("cooling down"); e.code = 429; throw e; }
+    // An account whose refresh token Anthropic has rejected cannot recover on
+    // its own. Retrying it every 5 minutes only earns auth-failure 429s, which
+    // is what used to take the healthy accounts down with it.
+    if (!meta.active) {
+      const snap = loadSnapshot(slug);
+      if (snap && snap.needsLogin) throw new Error("needs /login as this account");
+    }
+    try {
+      let { tok, canRefresh } = await tokenForAccount(slug, meta);
+      let res = await rawFetchUsage(tok);
+      if (res.unauth && canRefresh) { tok = await refreshSnapshot(slug); res = await rawFetchUsage(tok); }
+      if (res.unauth) throw new Error("login expired");
+      const data = { active: meta.active, ...res.usage };
+      usageCache.set(slug, { at: Date.now(), data });
+      cooldowns.delete(slug);
+      markLogin(slug, false);
+      return data;
+    } catch (e) {
+      if (e && e.code === 429 && e.retryAfterMs) cooldowns.set(slug, Date.now() + e.retryAfterMs);
+      if (/refresh HTTP 4\d\d/.test(String(e && e.message))) markLogin(slug, true);
+      throw e;
+    }
   });
 }
 async function getUsage(slug, force) {
