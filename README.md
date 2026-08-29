@@ -122,10 +122,16 @@ account**, grouped by account with each session's tty and folder. Two actions:
   **Ticket Workers go back through Fredrin.** A session in `~/.fredrin/worktrees/`
   belongs to Fredrin's Worker surface, which the terminals API can't reach, and
   reopening it as a loose terminal would keep the transcript but drop the ticket
-  association. Instead the ticket id is read off the worktree name
-  (`<project>.<TICKET>`), confirmed against the API, and the Worker is
-  redispatched with `fredrin tickets start` — which resumes the ticket's session
-  and keeps it wired to the ticket. Without `--relaunch` these are only reported.
+  association. What works is that the pane's **shell outlives claude**: kill the
+  agent and Fredrin still owns the session, so `fredrin sessions send` types
+  straight into that same pane. The Worker's own argv is reused verbatim —
+  Fredrin's settings, plugin dir, model and effort — with the session flags
+  swapped for `--resume`, so it returns as the same Worker on the same ticket
+  with its transcript.
+
+  `fredrin tickets start` does **not** work here: the live shell means the
+  session is no zombie, so it returns `reused: true` and spawns nothing.
+  Without `--relaunch` these are only reported.
 - **Stop them** stops the sessions without reopening.
 - **Just copy the resume commands** stops nothing at all.
 
