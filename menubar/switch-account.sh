@@ -1,9 +1,9 @@
 #!/bin/sh
 # Switch the active Claude Code account from the SwiftBar menu.
 #
-# The switch is a Keychain write: running `claude` sessions re-read their
-# credentials from the Keychain on a short cache, so they pick the new account
-# up on their own within about a minute — nothing needs restarting.
+# The switch is a Keychain write. Claude Code resolves its bearer token once per
+# process and memoizes it with no expiry, so this reaches sessions started
+# afterwards — anything already running keeps its account until it restarts.
 set -u
 SLUG="${1:-}"
 [ -n "$SLUG" ] || exit 1
@@ -23,8 +23,9 @@ if not d.get("ok"):
     print("Switch failed: " + str(d.get("error") or "unknown error")); raise SystemExit
 if d.get("already"):
     print(str(d.get("active")) + " is already the active account"); raise SystemExit
-n = d.get("sessions") or 0
-tail = " · %d live session%s pick it up within ~1 min" % (n, "" if n == 1 else "s") if n else ""
+n = d.get("stale") or 0
+tail = (" \u00b7 %d session%s still on the old account \u2014 restart from the menu"
+        % (n, "" if n == 1 else "s")) if n else ""
 print("Now on " + str(d.get("active")) + tail)
 ')
 

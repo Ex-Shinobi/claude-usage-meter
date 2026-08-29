@@ -92,10 +92,25 @@ numbers, marked `⚠ cached 2d ago` so old figures can't pass for current ones.
 ## Switching accounts
 
 Each non-active account in the dropdown has a **⇄ Switch to this account** item.
-Clicking it swaps the active Claude Code login, and **every running `claude`
-session picks it up within about a minute — nothing needs restarting.** That
-works because Claude Code re-reads its credentials from the Keychain on a short
-cache rather than holding them for the life of the process.
+Clicking it swaps the active Claude Code login, which takes effect for **sessions
+started from then on**.
+
+Sessions already running keep the account they started with. Claude Code reads
+the Keychain through a 30-second cache, but the resolved bearer token sits above
+that in a memo with no expiry, cleared only by that process logging in, logging
+out, or saving refreshed tokens. Nothing watches the Keychain for outside
+changes, so a switch cannot be pushed into a running session.
+
+The dropdown therefore lists what got left behind — **⟳ N sessions on another
+account**, grouped by account with each session's tty and folder. Two actions:
+
+- **Restart them** stops those sessions and copies a `claude --resume <id>` line
+  for each to the clipboard (also saved to `resume-stale-sessions.sh` in the
+  state dir), so the conversations come back on the new account.
+- **Just copy the resume commands** does the same without stopping anything.
+
+Sessions run inside Fredrin or cmux panes rather than plain Terminal tabs, so
+relaunching is a paste rather than something the meter can do for you.
 
 The switch replaces `claudeAiOauth` in the Keychain item and the `oauthAccount`
 key in `~/.claude.json`. It deliberately leaves the rest of the Keychain blob

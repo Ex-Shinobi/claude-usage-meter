@@ -158,6 +158,7 @@ def title_image(parts):
     return base64.b64encode(buf.getvalue()).decode()
 
 SWITCH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "switch-account.sh")
+RESTART = os.path.join(os.path.dirname(os.path.abspath(__file__)), "restart-stale-sessions.py")
 
 state = get(BASE + "/api/state", 4)
 if not state:
@@ -245,6 +246,25 @@ for a in accounts:
               " terminal=false refresh=true font=Menlo size=11")
     print("---")
 
+# A switch only reaches sessions that start afterwards — Claude Code pins its
+# token per process. Surface the ones still on the old account, since they are
+# invisible otherwise and quietly keep spending the wrong account's limits.
+sess = get(BASE + "/api/sessions", 4) or {}
+stale = [x for x in (sess.get("sessions") or []) if x.get("stale")]
+if stale:
+    by_acct = {}
+    for x in stale:
+        by_acct.setdefault(x.get("email") or "unknown", []).append(x)
+    print("\u27f3 " + str(len(stale)) + " session" + ("" if len(stale) == 1 else "s") +
+          " on another account | font=Menlo size=12 color=#e0b34f")
+    for acct, rows in sorted(by_acct.items()):
+        print("--" + acct + " | font=Menlo size=12")
+        for x in rows:
+            print("--" + (x.get("tty") or "?").ljust(9) + " " + (x.get("folder") or "") +
+                  " | font=Menlo size=11 color=#8b93a7")
+    print("--Restart them \u00b7 copies resume commands | bash=" + RESTART +
+          " param1=--kill terminal=false refresh=true")
+    print("--Just copy the resume commands | bash=" + RESTART + " terminal=false refresh=true")
 print("Refresh now | refresh=true")
 # carry the token so the first click authorizes the browser; the server then
 # sets a cookie and redirects to the bare URL

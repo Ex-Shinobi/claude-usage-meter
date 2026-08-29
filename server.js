@@ -241,7 +241,10 @@ async function switchTo(slug) {
   const identity = writeIdentity(snap.oauthAccount);
   usageCache.clear();                          // active flags just moved
   lastCapture = Date.now();                    // don't recapture over the switch
-  return { active: target.label, identity, sessions };
+  // Sessions already running keep the account they resolved at startup, so say
+  // how many were left behind rather than implying the switch reached them.
+  const stale = listSessions().filter((x) => x.stale).length;
+  return { active: target.label, identity, sessions, stale };
 }
 
 // ---------- live sessions ----------
@@ -282,7 +285,7 @@ function listSessions() {
     if (sid) liveSids.add(sid);
     const rec = sid ? acctBySid.get(sid) : null;
     out.push({
-      pid, tty, sessionId: sid,
+      pid, tty, sessionId: sid, cwd: md.cwd || "",
       folder: (md.cwd || "").split("/").filter(Boolean).pop() || "",
       email: rec ? (rec.email || null) : null,
     });
@@ -291,6 +294,11 @@ function listSessions() {
   for (const { f, r } of readAllJson(SESS_DIR)) {
     if (!liveSids.has(r.sessionId)) { try { fs.unlinkSync(path.join(SESS_DIR, f)); } catch (_) {} }
   }
+  // Claude Code resolves its bearer token once per process and memoizes it with
+  // no expiry, so a session keeps the account it started with until it restarts.
+  // A switch reaches new sessions only — these are the ones left behind.
+  const now = currentEmail();
+  for (const r of out) r.stale = !!(now && r.email && r.email !== now);
   return out.sort((a, b) => ((a.email || "~~") .localeCompare(b.email || "~~")) || (a.tty || "").localeCompare(b.tty || ""));
 }
 
