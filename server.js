@@ -398,7 +398,7 @@ function fetchAndCache(slug) {
     // is what used to take the healthy accounts down with it.
     if (!meta.active) {
       const snap = loadSnapshot(slug);
-      if (snap && snap.needsLogin) throw new Error("needs /login as this account");
+      if (snap && snap.needsLogin) throw new Error("needs re-login as this account");
     }
     try {
       let { tok, canRefresh } = await tokenForAccount(slug, meta);
