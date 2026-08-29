@@ -11,7 +11,7 @@ back on the new account.
   restart-stale-sessions.py --kill       terminate them, then emit the commands
   restart-stale-sessions.py --relaunch   terminate them and reopen each one
 """
-import json, os, re, shutil, subprocess, sys, time, urllib.request
+import json, os, re, shlex, shutil, subprocess, sys, time, urllib.request
 
 BASE = "http://127.0.0.1:4177"
 STATE = os.environ.get("CLAUDE_USAGE_HOME") or os.path.join(
@@ -75,6 +75,57 @@ def fredrin_panes():
         if found:
             out[found[-1]] = pane          # last launch wins: the pane may have restarted
     return out, cwds
+
+
+def fredrin_session_for(cwd):
+    """The Fredrin session id owning a worktree. `sessions list` covers ticket
+    Workers, and a worktree path belongs to exactly one ticket, so this is
+    unambiguous where a bare cwd match would not be."""
+    try:
+        out = subprocess.run(["fredrin", "sessions", "list"], capture_output=True,
+                             text=True, timeout=20).stdout
+    except Exception:
+        return None
+    for line in out.splitlines():
+        if line.rstrip().endswith(cwd.rstrip("/")):
+            m = re.search(r"(" + UUID + ")", line)
+            if m:
+                return m.group(1)
+    return None
+
+
+def relaunch_cmd(pid, session_id):
+    """Rebuild a session's own launch command, pointed at its transcript.
+
+    A Worker carries Fredrin's settings, plugin dir, model and effort — relaunching
+    it as a bare `claude` would keep the pane but drop all of that — so its argv is
+    reused verbatim, minus any session flags, plus --resume.
+    """
+    try:
+        cmd = subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=10).stdout.strip()
+    except Exception:
+        return None
+    if not cmd:
+        return None
+    try:
+        argv = shlex.split(cmd)
+    except ValueError:
+        return None
+    out, skip = [], 0
+    for i, a in enumerate(argv):
+        if skip:
+            skip -= 1
+            continue
+        if a in ("--resume", "--session-id"):
+            skip = 1
+            continue
+        if a == "--fork-session":
+            continue
+        out.append(a)
+    out[0] = "claude"                      # argv[0] may be an absolute path
+    out += ["--resume", session_id]
+    return " ".join(shlex.quote(a) for a in out)
 
 
 def ticket_for(cwd):
@@ -229,24 +280,30 @@ def main():
     # otherwise a Worker is reported and left alone.
     if relaunch:
         for w in workers:
-            ident = ticket_for(w.get("cwd") or "")
-            if not ident:
-                print("# %s: no ticket id resolved — left running" % (w.get("folder") or "?"))
+            cwd, sid, pid = w.get("cwd") or "", w.get("sessionId"), w.get("pid")
+            fsid = fredrin_session_for(cwd)
+            cmd = relaunch_cmd(pid, sid) if sid else None
+            if not (fsid and cmd):
+                print("# %s: could not resolve its Fredrin session — left running"
+                      % (w.get("folder") or "?"))
                 continue
             try:
-                os.kill(int(w["pid"]), 15)
+                os.kill(int(pid), 15)
                 killed += 1
             except Exception:
                 pass
-            if not gone(int(w["pid"])):
-                print("# %s: did not exit, not redispatched" % ident)
+            if not gone(int(pid)):
+                print("# %s: did not exit, not restarted" % (w.get("folder") or "?"))
                 continue
+            # The pane's shell outlives claude, so Fredrin still owns the session
+            # and `sessions send` types straight into that same pane. `tickets
+            # start` cannot do this: it sees the session as live and no-ops.
             try:
-                subprocess.run(["fredrin", "tickets", "start", ident],
-                               capture_output=True, timeout=60)
-                print("# %s: redispatched through Fredrin" % ident)
+                subprocess.run(["fredrin", "sessions", "send", fsid, cmd],
+                               capture_output=True, timeout=30)
+                print("# %s: restarted in its own Worker pane" % (w.get("folder") or "?"))
             except Exception:
-                print("# %s: redispatch failed — start it from Fredrin" % ident)
+                print("# %s: restart failed — start it from Fredrin" % (w.get("folder") or "?"))
 
     opened, how, used = 0, set(), set()
     for s in stale:
