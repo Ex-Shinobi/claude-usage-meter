@@ -11,7 +11,7 @@ back on the new account.
   restart-stale-sessions.py --kill       terminate them, then emit the commands
   restart-stale-sessions.py --relaunch   terminate them and reopen each one
 """
-import json, os, re, shlex, shutil, subprocess, sys, time, urllib.request
+import glob, json, os, re, shlex, shutil, subprocess, sys, time, urllib.request
 
 BASE = "http://127.0.0.1:4177"
 STATE = os.environ.get("CLAUDE_USAGE_HOME") or os.path.join(
@@ -97,9 +97,15 @@ def fredrin_session_for(cwd):
 def relaunch_cmd(pid, session_id):
     """Rebuild a session's own launch command, pointed at its transcript.
 
-    A Worker carries Fredrin's settings, plugin dir, model and effort — relaunching
-    it as a bare `claude` would keep the pane but drop all of that — so its argv is
-    reused verbatim, minus any session flags, plus --resume.
+    A pane carries Fredrin's settings, plugin dir, model and effort — relaunching
+    it as a bare `claude` would keep the pane but drop all of that — so its argv
+    is reused, minus any session flags, plus --resume.
+
+    `ps` prints argv flattened with spaces and no quoting, so it cannot be split
+    on whitespace: Fredrin's settings path contains one ("Application Support"),
+    and splitting there produces `--settings /…/Application`, which claude
+    rejects with "Settings file not found". Arguments are therefore cut at
+    `--flag` boundaries, and everything up to the next flag is one value.
     """
     try:
         cmd = subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(pid)],
@@ -108,24 +114,30 @@ def relaunch_cmd(pid, session_id):
         return None
     if not cmd:
         return None
-    try:
-        argv = shlex.split(cmd)
-    except ValueError:
-        return None
-    out, skip = [], 0
-    for i, a in enumerate(argv):
-        if skip:
-            skip -= 1
+    pairs, flag, value = [], None, []
+    for tok in cmd.split(" "):
+        if not tok:
             continue
-        if a in ("--resume", "--session-id"):
-            skip = 1
+        if tok.startswith("--"):
+            if flag is not None:
+                pairs.append((flag, " ".join(value)))
+            flag, value = tok, []
+        elif flag is None:
+            continue                      # the program path itself
+        else:
+            value.append(tok)
+    if flag is not None:
+        pairs.append((flag, " ".join(value)))
+
+    out = ["claude"]
+    for f, v in pairs:
+        if f in ("--resume", "--session-id", "--fork-session"):
             continue
-        if a == "--fork-session":
-            continue
-        out.append(a)
-    out[0] = "claude"                      # argv[0] may be an absolute path
+        out.append(f)
+        if v:
+            out.append(shlex.quote(v))
     out += ["--resume", session_id]
-    return " ".join(shlex.quote(a) for a in out)
+    return " ".join(out)
 
 
 def ticket_for(cwd):
@@ -166,6 +178,52 @@ def gone(pid, timeout=8.0):
     return False
 
 
+def transcript(sid):
+    hits = glob.glob(os.path.expanduser("~/.claude/projects/*/" + str(sid) + ".jsonl"))
+    return hits[0] if hits else None
+
+
+def settle(sid, quiet=4.0, timeout=45.0):
+    """Wait for a session to stop writing its transcript.
+
+    SIGTERM mid-turn can cut a tool call half-done, so an interrupted session is
+    given a chance to come to rest first. False means it never went quiet — the
+    caller stops it anyway, but says so.
+    """
+    path = transcript(sid)
+    if not path:
+        return True
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            if time.time() - os.path.getmtime(path) >= quiet:
+                return True
+        except Exception:
+            return True
+        time.sleep(1.0)
+    return False
+
+
+def interrupt(sid, pane=None, fsid=None):
+    """Send ESC so the session ends its turn cleanly before being stopped.
+
+    Workers take `sessions send --interrupt`; a terminal pane has no such flag,
+    so ESC is typed straight in with no newline, which is what the key does.
+    """
+    try:
+        if fsid:
+            subprocess.run(["fredrin", "sessions", "send", fsid, "--interrupt"],
+                           capture_output=True, timeout=20)
+        elif pane:
+            subprocess.run(["fredrin", "terminals", "send", pane, "\x1b", "--no-enter"],
+                           capture_output=True, timeout=20)
+        else:
+            return False
+    except Exception:
+        return False
+    return settle(sid)
+
+
 def term_count():
     """How many tabs the Fredrin terminals panel currently holds."""
     try:
@@ -176,25 +234,23 @@ def term_count():
 
 
 def reopen(cmd, name):
-    """Reopen a session. Fredrin's terminals panel first — it is where these
-    sessions live — but `terminals new` exits 0 and does nothing when that panel
-    is closed, so confirm a tab actually appeared before believing it."""
-    if shutil.which("fredrin"):
-        before = term_count()
-        try:
-            subprocess.run(["fredrin", "terminals", "new", "1", "--cmd", cmd, "--name", name],
-                           capture_output=True, timeout=20)
-            if before >= 0 and term_count() > before:
-                return "fredrin"
-        except Exception:
-            pass
+    """Open a session in a new Fredrin tab.
+
+    Only Fredrin: these sessions live in Fredrin (or cmux) panes, and putting one
+    in a Terminal.app window instead scatters them across apps the user is not
+    working in. `terminals new` exits 0 and does nothing when the Terminals panel
+    is closed, so a tab must actually appear; otherwise the session is left
+    stopped and reported, with its resume command already on the clipboard.
+    """
+    if not shutil.which("fredrin"):
+        return None
+    before = term_count()
     try:
-        subprocess.run(["/usr/bin/osascript", "-e",
-                        'on run argv\ntell application "Terminal"\nactivate\ndo script (item 1 of argv)\n'
-                        'end tell\nend run', cmd], capture_output=True, timeout=20)
-        return "terminal"
+        subprocess.run(["fredrin", "terminals", "new", "1", "--cmd", cmd, "--name", name],
+                       capture_output=True, timeout=20)
     except Exception:
         return None
+    return "fredrin" if before >= 0 and term_count() > before else None
 
 
 def main():
@@ -267,8 +323,24 @@ def main():
     cmds = ({s.get("pid"): relaunch_cmd(s.get("pid"), s.get("sessionId"))
              for s in stale + workers if s.get("sessionId")} if relaunch else {})
 
+    # Resolve each pane while its session is still running, so the session can be
+    # interrupted through that pane before it is stopped.
+    pane_for, used = {}, set()
+    for s in stale:
+        pane = panes.get(launch_ids.get(s.get("pid")))
+        if not pane:
+            hits = [p for p, c in pane_cwds.items()
+                    if c == (s.get("cwd") or "") and p not in panes.values() and p not in used]
+            pane = hits[0] if len(hits) == 1 else None
+        if pane:
+            used.add(pane)
+            pane_for[s.get("pid")] = pane
+
     killed = 0
     for s in stale:
+        if relaunch and not interrupt(s.get("sessionId"), pane=pane_for.get(s.get("pid"))):
+            print("# %s: did not go quiet after ESC — stopping it anyway"
+                  % (s.get("folder") or s.get("tty") or "?"))
         try:
             os.kill(int(s["pid"]), 15)   # SIGTERM: let it shut down cleanly
             killed += 1
@@ -292,6 +364,9 @@ def main():
                 print("# %s: could not resolve its Fredrin session — left running"
                       % (w.get("folder") or "?"))
                 continue
+            if not interrupt(sid, fsid=fsid):
+                print("# %s: did not go quiet after ESC — stopping it anyway"
+                      % (w.get("folder") or "?"))
             try:
                 os.kill(int(pid), 15)
                 killed += 1
@@ -310,23 +385,14 @@ def main():
             except Exception:
                 print("# %s: restart failed — start it from Fredrin" % (w.get("folder") or "?"))
 
-    opened, how, used = 0, set(), set()
+    opened, how = 0, set()
     for s in stale:
         sid, cwd = s.get("sessionId"), s.get("cwd") or os.path.expanduser("~")
         if not sid:
             continue
-        # Reuse the session's own Fredrin pane when we can find it: that keeps the
-        # tab, its place in the layout, and — for a ticket Worker — the pane
-        # Fredrin associates with the ticket.
-        pane = panes.get(launch_ids.get(s.get("pid")))
-        if not pane:
-            # Second route: a pane whose cwd matches, but only when exactly one
-            # unclaimed pane has it — otherwise there is no way to tell which.
-            hits = [p for p, c in pane_cwds.items()
-                    if c == (s.get("cwd") or "") and p not in panes.values() and p not in used]
-            pane = hits[0] if len(hits) == 1 else None
-        if pane:
-            used.add(pane)
+        # The pane resolved before the kill — it keeps the tab and its place in
+        # the layout, instead of the session coming back somewhere else.
+        pane = pane_for.get(s.get("pid"))
         cmd = cmds.get(s.get("pid"))
         if pane and cmd and gone(int(s["pid"])):
             # On exit claude prints "Resume this session with: claude --resume <id>",
@@ -350,10 +416,15 @@ def main():
             else:
                 print("# %s: pane did not confirm the session, opening a new tab instead"
                       % (s.get("folder") or "?"))
-        where = reopen("cd %s && claude --resume %s" % (json.dumps(cwd), sid), s.get("folder") or "claude")
+        where = reopen("cd %s && %s" % (shlex.quote(cwd), cmd or ("claude --resume " + sid)),
+                       s.get("folder") or "claude")
         if where:
             opened += 1
             how.add(where)
+        else:
+            print("# %s: stopped, but no Fredrin tab could be opened (is the Terminals "
+                  "panel open?) — its resume command is on the clipboard"
+                  % (s.get("folder") or s.get("tty") or "?"))
     notify("Stopped %d · reopened %d via %s · commands still on the clipboard"
            % (killed, opened, "/".join(sorted(how)) or "nothing"))
     return 0

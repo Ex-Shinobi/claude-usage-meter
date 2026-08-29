@@ -122,9 +122,16 @@ account**, grouped by account with each session's tty and folder. Two actions:
 
   Where a pane can't be identified — the launch line has scrolled out of
   scrollback, several panes share a cwd, or the session lives in another app
-  entirely — it falls back to a new Fredrin tab, and then to a Terminal.app
-  window. (`fredrin terminals new` exits 0 without doing anything when the
-  Terminals panel is closed, so success is checked by watching the tab count.)
+  entirely — it falls back to a new Fredrin tab, and nothing else. Sessions live
+  in Fredrin (or cmux) panes, so scattering them into Terminal.app windows is
+  worse than not reopening them. `fredrin terminals new` exits 0 without doing
+  anything when the Terminals panel is closed, so a tab must actually appear;
+  otherwise the session is left stopped and reported, resume command already on
+  the clipboard.
+
+  Before stopping anything it sends ESC and waits for the transcript to go quiet,
+  so a session mid-turn is not cut off in the middle of a tool call. A session
+  with no pane (cmux) has no channel for ESC and is reported as stopped anyway.
 
   **Ticket Workers go back through Fredrin.** A session in `~/.fredrin/worktrees/`
   belongs to Fredrin's Worker surface, which the terminals API can't reach, and
