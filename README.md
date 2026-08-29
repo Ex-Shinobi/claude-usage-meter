@@ -106,9 +106,23 @@ account**, grouped by account with each session's tty and folder. Two actions:
 
 - **Restart them** stops those sessions and reopens each one with
   `claude --resume <id>`, so the conversations come back on the new account by
-  themselves. Reopening prefers a Fredrin terminal tab; `fredrin terminals new`
-  exits 0 without doing anything when that panel is closed, so the script checks
-  that a tab really appeared and otherwise falls back to a Terminal.app window.
+  themselves. It reuses the session's **own Fredrin pane** wherever it can, so
+  the tab and its place in the layout survive: a pane prints the command line it
+  launched with, so its scrollback carries the `--session-id` to match against
+  the process's argv, and `fredrin terminals send` types the resume command back
+  into that same pane. Text is only ever sent to a pane whose claude has been
+  confirmed dead, so it can never land in a live prompt.
+
+  Where a pane can't be identified — the launch line has scrolled out of
+  scrollback, several panes share a cwd, or the session lives in another app
+  entirely — it falls back to a new Fredrin tab, and then to a Terminal.app
+  window. (`fredrin terminals new` exits 0 without doing anything when the
+  Terminals panel is closed, so success is checked by watching the tab count.)
+
+  **Ticket Workers are left alone.** A session in `~/.fredrin/worktrees/` belongs
+  to Fredrin's Worker surface, which the terminals API can't reach; reopening it
+  as a loose terminal would keep the transcript but drop the ticket association.
+  Those are reported for `fredrin tickets start <id>` instead.
 - **Stop them** stops the sessions without reopening.
 - **Just copy the resume commands** stops nothing at all.
 

@@ -11,7 +11,7 @@ back on the new account.
   restart-stale-sessions.py --kill       terminate them, then emit the commands
   restart-stale-sessions.py --relaunch   terminate them and reopen each one
 """
-import json, os, shutil, subprocess, sys, time, urllib.request
+import json, os, re, shutil, subprocess, sys, time, urllib.request
 
 BASE = "http://127.0.0.1:4177"
 STATE = os.environ.get("CLAUDE_USAGE_HOME") or os.path.join(
@@ -41,6 +41,63 @@ def notify(msg):
     subprocess.run(["/usr/bin/osascript", "-e",
                     'on run argv\ndisplay notification (item 1 of argv) with title "Claude Usage Meter"\nend run',
                     msg], capture_output=True)
+
+
+UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+
+
+def fredrin_panes():
+    """Map a Fredrin pane id to the session id its shell launched claude with.
+
+    A pane prints its own command line, so its scrollback carries the
+    `--session-id`/`--resume` it started from. That is the launch id, not
+    necessarily the live one (resuming mints a new id), so it is matched
+    against the same flag in the process's argv rather than against the
+    session id the meter reports.
+    """
+    out, cwds = {}, {}
+    try:
+        listing = subprocess.run(["fredrin", "terminals", "list"], capture_output=True,
+                                 text=True, timeout=15).stdout
+    except Exception:
+        return out, cwds
+    for line in listing.splitlines():
+        m = re.search(r"(term-[0-9a-f-]+)\s+(.*?)\s\s+(/.*)$", line)
+        if m:
+            cwds[m.group(1)] = m.group(3).strip()
+    for pane in re.findall(r"term-[0-9a-f-]+", listing):
+        try:
+            text = subprocess.run(["fredrin", "terminals", "read", pane, "--tail", "400"],
+                                  capture_output=True, text=True, timeout=25).stdout
+        except Exception:
+            continue
+        found = re.findall(r"--(?:session-id|resume)\s+(" + UUID + ")", text)
+        if found:
+            out[found[-1]] = pane          # last launch wins: the pane may have restarted
+    return out, cwds
+
+
+def launch_id(pid):
+    """The session id in a running claude's argv."""
+    try:
+        cmd = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return None
+    m = re.search(r"--(?:session-id|resume)\s+(" + UUID + ")", cmd)
+    return m.group(1) if m else None
+
+
+def gone(pid, timeout=8.0):
+    """Wait for a pid to actually exit — never type into a pane still running claude."""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return True
+        time.sleep(0.25)
+    return False
 
 
 def term_count():
@@ -94,6 +151,14 @@ def main():
     stale = [s for s in (d.get("sessions") or []) if s.get("stale")]
     skipped = [s for s in stale if s.get("sessionId") in protected]
     stale = [s for s in stale if s.get("sessionId") not in protected]
+    # A ticket Worker lives in Fredrin's Worker surface, which the terminals API
+    # cannot reach. Relaunching it as a loose terminal would keep the transcript
+    # but drop the ticket association, so leave it to Fredrin.
+    workers = [s for s in stale if "/.fredrin/worktrees/" in (s.get("cwd") or "")]
+    stale = [s for s in stale if s not in workers]
+    if workers:
+        print("# ticket Workers — restart from Fredrin (fredrin tickets start <id>): %s" %
+              ", ".join((w.get("folder") or "?") for w in workers))
     if skipped:
         print("# protected, left running: %s" %
               ", ".join((s.get("tty") or "?") + " " + (s.get("folder") or "") for s in skipped))
@@ -125,6 +190,12 @@ def main():
         notify("%d session(s) on another account · commands copied" % len(stale))
         return 0
 
+    # Read the pane map before killing anything: a dead session's pane still
+    # shows the command line it launched with, but the argv match needs the
+    # process alive.
+    panes, pane_cwds = fredrin_panes() if relaunch else ({}, {})
+    launch_ids = {s.get("pid"): launch_id(s.get("pid")) for s in stale} if relaunch else {}
+
     killed = 0
     for s in stale:
         try:
@@ -137,12 +208,32 @@ def main():
         notify("Stopped %d session(s) · resume commands copied to the clipboard" % killed)
         return 0
 
-    time.sleep(2)                        # let them release their panes first
-    opened, how = 0, set()
+    opened, how, used = 0, set(), set()
     for s in stale:
         sid, cwd = s.get("sessionId"), s.get("cwd") or os.path.expanduser("~")
         if not sid:
             continue
+        # Reuse the session's own Fredrin pane when we can find it: that keeps the
+        # tab, its place in the layout, and — for a ticket Worker — the pane
+        # Fredrin associates with the ticket.
+        pane = panes.get(launch_ids.get(s.get("pid")))
+        if not pane:
+            # Second route: a pane whose cwd matches, but only when exactly one
+            # unclaimed pane has it — otherwise there is no way to tell which.
+            hits = [p for p, c in pane_cwds.items()
+                    if c == (s.get("cwd") or "") and p not in panes.values() and p not in used]
+            pane = hits[0] if len(hits) == 1 else None
+        if pane:
+            used.add(pane)
+        if pane and gone(int(s["pid"])):
+            try:
+                subprocess.run(["fredrin", "terminals", "send", pane,
+                                "claude --resume " + sid], capture_output=True, timeout=20)
+                opened += 1
+                how.add("in place")
+                continue
+            except Exception:
+                pass
         where = reopen("cd %s && claude --resume %s" % (json.dumps(cwd), sid), s.get("folder") or "claude")
         if where:
             opened += 1
