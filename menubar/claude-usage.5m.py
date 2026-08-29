@@ -262,7 +262,9 @@ if stale:
         for x in rows:
             print("--" + (x.get("tty") or "?").ljust(9) + " " + (x.get("folder") or "") +
                   " | font=Menlo size=11 color=#8b93a7")
-    print("--Restart them \u00b7 copies resume commands | bash=" + RESTART +
+    print("--Restart them \u00b7 stops and reopens each | bash=" + RESTART +
+          " param1=--relaunch terminal=false refresh=true")
+    print("--Stop them \u00b7 copy resume commands | bash=" + RESTART +
           " param1=--kill terminal=false refresh=true")
     print("--Just copy the resume commands | bash=" + RESTART + " terminal=false refresh=true")
 print("Refresh now | refresh=true")

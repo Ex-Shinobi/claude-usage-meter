@@ -104,13 +104,21 @@ changes, so a switch cannot be pushed into a running session.
 The dropdown therefore lists what got left behind — **⟳ N sessions on another
 account**, grouped by account with each session's tty and folder. Two actions:
 
-- **Restart them** stops those sessions and copies a `claude --resume <id>` line
-  for each to the clipboard (also saved to `resume-stale-sessions.sh` in the
-  state dir), so the conversations come back on the new account.
-- **Just copy the resume commands** does the same without stopping anything.
+- **Restart them** stops those sessions and reopens each one with
+  `claude --resume <id>`, so the conversations come back on the new account by
+  themselves. Reopening prefers a Fredrin terminal tab; `fredrin terminals new`
+  exits 0 without doing anything when that panel is closed, so the script checks
+  that a tab really appeared and otherwise falls back to a Terminal.app window.
+- **Stop them** stops the sessions without reopening.
+- **Just copy the resume commands** stops nothing at all.
 
-Sessions run inside Fredrin or cmux panes rather than plain Terminal tabs, so
-relaunching is a paste rather than something the meter can do for you.
+A session listed in `protected-sessions` in the state dir (one id per line) is
+never stopped — put the session you are working in there, since the script can
+reopen a session but cannot undo stopping the one that was driving it.
+
+All three put the resume lines on the clipboard and in `resume-stale-sessions.sh`
+in the state dir. Don't run that file directly — it would launch every session
+sequentially in one terminal, each blocking the next.
 
 The switch replaces `claudeAiOauth` in the Keychain item and the `oauthAccount`
 key in `~/.claude.json`. It deliberately leaves the rest of the Keychain blob
