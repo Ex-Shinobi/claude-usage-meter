@@ -113,6 +113,13 @@ account**, grouped by account with each session's tty and folder. Two actions:
   into that same pane. Text is only ever sent to a pane whose claude has been
   confirmed dead, so it can never land in a live prompt.
 
+  The command it types is the session's **own argv**, read before the process is
+  killed, with the session flags swapped for `--resume` — a bare `claude --resume`
+  would drop the settings and plugin dir Fredrin launches its panes with. And
+  before typing, the pane must name the session: on exit claude prints
+  `Resume this session with: claude --resume <id>`, so a pane identified only by
+  elimination still has to confirm itself, or a new tab is opened instead.
+
   Where a pane can't be identified — the launch line has scrolled out of
   scrollback, several panes share a cwd, or the session lives in another app
   entirely — it falls back to a new Fredrin tab, and then to a Terminal.app

@@ -261,6 +261,11 @@ def main():
     # process alive.
     panes, pane_cwds = fredrin_panes() if relaunch else ({}, {})
     launch_ids = {s.get("pid"): launch_id(s.get("pid")) for s in stale} if relaunch else {}
+    # argv has to be read while the process is alive, and a bare `claude --resume`
+    # would drop the flags Fredrin launches its panes with — its hooks settings and
+    # plugin dir — leaving a session that no longer talks to Fredrin.
+    cmds = ({s.get("pid"): relaunch_cmd(s.get("pid"), s.get("sessionId"))
+             for s in stale + workers if s.get("sessionId")} if relaunch else {})
 
     killed = 0
     for s in stale:
@@ -282,7 +287,7 @@ def main():
         for w in workers:
             cwd, sid, pid = w.get("cwd") or "", w.get("sessionId"), w.get("pid")
             fsid = fredrin_session_for(cwd)
-            cmd = relaunch_cmd(pid, sid) if sid else None
+            cmd = cmds.get(pid)
             if not (fsid and cmd):
                 print("# %s: could not resolve its Fredrin session — left running"
                       % (w.get("folder") or "?"))
@@ -322,15 +327,29 @@ def main():
             pane = hits[0] if len(hits) == 1 else None
         if pane:
             used.add(pane)
-        if pane and gone(int(s["pid"])):
+        cmd = cmds.get(s.get("pid"))
+        if pane and cmd and gone(int(s["pid"])):
+            # On exit claude prints "Resume this session with: claude --resume <id>",
+            # so the pane names the session it just lost. Requiring that before
+            # typing turns a by-elimination guess into a verified match — and stops
+            # a command being typed into some other session as a chat message.
             try:
-                subprocess.run(["fredrin", "terminals", "send", pane,
-                                "claude --resume " + sid], capture_output=True, timeout=20)
-                opened += 1
-                how.add("in place")
-                continue
+                tail = subprocess.run(["fredrin", "terminals", "read", pane, "--tail", "8"],
+                                      capture_output=True, text=True, timeout=20).stdout
             except Exception:
-                pass
+                tail = ""
+            if sid in tail:
+                try:
+                    subprocess.run(["fredrin", "terminals", "send", pane, cmd],
+                                   capture_output=True, timeout=20)
+                    opened += 1
+                    how.add("in place")
+                    continue
+                except Exception:
+                    pass
+            else:
+                print("# %s: pane did not confirm the session, opening a new tab instead"
+                      % (s.get("folder") or "?"))
         where = reopen("cd %s && claude --resume %s" % (json.dumps(cwd), sid), s.get("folder") or "claude")
         if where:
             opened += 1
