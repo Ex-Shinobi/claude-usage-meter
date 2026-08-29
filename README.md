@@ -119,10 +119,13 @@ account**, grouped by account with each session's tty and folder. Two actions:
   window. (`fredrin terminals new` exits 0 without doing anything when the
   Terminals panel is closed, so success is checked by watching the tab count.)
 
-  **Ticket Workers are left alone.** A session in `~/.fredrin/worktrees/` belongs
-  to Fredrin's Worker surface, which the terminals API can't reach; reopening it
-  as a loose terminal would keep the transcript but drop the ticket association.
-  Those are reported for `fredrin tickets start <id>` instead.
+  **Ticket Workers go back through Fredrin.** A session in `~/.fredrin/worktrees/`
+  belongs to Fredrin's Worker surface, which the terminals API can't reach, and
+  reopening it as a loose terminal would keep the transcript but drop the ticket
+  association. Instead the ticket id is read off the worktree name
+  (`<project>.<TICKET>`), confirmed against the API, and the Worker is
+  redispatched with `fredrin tickets start` — which resumes the ticket's session
+  and keeps it wired to the ticket. Without `--relaunch` these are only reported.
 - **Stop them** stops the sessions without reopening.
 - **Just copy the resume commands** stops nothing at all.
 

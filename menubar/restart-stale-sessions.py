@@ -77,6 +77,21 @@ def fredrin_panes():
     return out, cwds
 
 
+def ticket_for(cwd):
+    """A worktree is named <project>.<TICKET-IDENT>, so the ticket id is the
+    suffix — confirmed against the API before it is used to dispatch anything."""
+    base = os.path.basename(cwd.rstrip("/"))
+    ident = base.rsplit(".", 1)[-1] if "." in base else None
+    if not ident:
+        return None
+    try:
+        out = subprocess.run(["fredrin", "tickets", "get", ident], capture_output=True,
+                             text=True, timeout=20).stdout
+        return ident if json.loads(out).get("ok") else None
+    except Exception:
+        return None
+
+
 def launch_id(pid):
     """The session id in a running claude's argv."""
     try:
@@ -157,8 +172,8 @@ def main():
     workers = [s for s in stale if "/.fredrin/worktrees/" in (s.get("cwd") or "")]
     stale = [s for s in stale if s not in workers]
     if workers:
-        print("# ticket Workers — restart from Fredrin (fredrin tickets start <id>): %s" %
-              ", ".join((w.get("folder") or "?") for w in workers))
+        print("# ticket Workers — redispatched through Fredrin so the ticket keeps its "
+              "Worker: %s" % ", ".join((w.get("folder") or "?") for w in workers))
     if skipped:
         print("# protected, left running: %s" %
               ", ".join((s.get("tty") or "?") + " " + (s.get("folder") or "") for s in skipped))
@@ -207,6 +222,31 @@ def main():
     if not relaunch:
         notify("Stopped %d session(s) · resume commands copied to the clipboard" % killed)
         return 0
+
+    # Ticket Workers can't be reached through the terminals API, but Fredrin can
+    # redispatch them itself: `tickets start` resumes the ticket's session and
+    # keeps the association the ticket is tracked by. Only with --relaunch —
+    # otherwise a Worker is reported and left alone.
+    if relaunch:
+        for w in workers:
+            ident = ticket_for(w.get("cwd") or "")
+            if not ident:
+                print("# %s: no ticket id resolved — left running" % (w.get("folder") or "?"))
+                continue
+            try:
+                os.kill(int(w["pid"]), 15)
+                killed += 1
+            except Exception:
+                pass
+            if not gone(int(w["pid"])):
+                print("# %s: did not exit, not redispatched" % ident)
+                continue
+            try:
+                subprocess.run(["fredrin", "tickets", "start", ident],
+                               capture_output=True, timeout=60)
+                print("# %s: redispatched through Fredrin" % ident)
+            except Exception:
+                print("# %s: redispatch failed — start it from Fredrin" % ident)
 
     opened, how, used = 0, set(), set()
     for s in stale:
