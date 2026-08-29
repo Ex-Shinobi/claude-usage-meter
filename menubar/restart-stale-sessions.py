@@ -218,7 +218,7 @@ def interrupt(sid, pane=None, fsid=None):
             subprocess.run(["fredrin", "terminals", "send", pane, "\x1b", "--no-enter"],
                            capture_output=True, timeout=20)
         else:
-            return False
+            return "no-channel"      # not a Fredrin pane: nothing to send ESC to
     except Exception:
         return False
     return settle(sid)
@@ -338,9 +338,14 @@ def main():
 
     killed = 0
     for s in stale:
-        if relaunch and not interrupt(s.get("sessionId"), pane=pane_for.get(s.get("pid"))):
-            print("# %s: did not go quiet after ESC — stopping it anyway"
-                  % (s.get("folder") or s.get("tty") or "?"))
+        if relaunch:
+            r = interrupt(s.get("sessionId"), pane=pane_for.get(s.get("pid")))
+            if r == "no-channel":
+                print("# %s: not a Fredrin pane, so no way to interrupt it first"
+                      % (s.get("folder") or s.get("tty") or "?"))
+            elif not r:
+                print("# %s: did not go quiet after ESC — stopping it anyway"
+                      % (s.get("folder") or s.get("tty") or "?"))
         try:
             os.kill(int(s["pid"]), 15)   # SIGTERM: let it shut down cleanly
             killed += 1
@@ -364,7 +369,7 @@ def main():
                 print("# %s: could not resolve its Fredrin session — left running"
                       % (w.get("folder") or "?"))
                 continue
-            if not interrupt(sid, fsid=fsid):
+            if interrupt(sid, fsid=fsid) is not True:
                 print("# %s: did not go quiet after ESC — stopping it anyway"
                       % (w.get("folder") or "?"))
             try:
