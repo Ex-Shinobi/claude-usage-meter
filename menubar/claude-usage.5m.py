@@ -157,8 +157,12 @@ def title_image(parts):
     img.save(buf, format="PNG", dpi=(72 * S, 72 * S))  # 144dpi => macOS lays it out at 1/2 pixel size
     return base64.b64encode(buf.getvalue()).decode()
 
-SWITCH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "switch-account.sh")
-RESTART = os.path.join(os.path.dirname(os.path.abspath(__file__)), "restart-stale-sessions.py")
+# The helpers live outside this folder on purpose: SwiftBar's plugin directory is
+# menubar/, so anything executable in here is loaded as its own plugin and its
+# output painted into the menu bar.
+_BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin")
+SWITCH = os.path.join(_BIN, "switch-account.sh")
+RESTART = os.path.join(_BIN, "restart-stale-sessions.py")
 
 state = get(BASE + "/api/state", 4)
 if not state:

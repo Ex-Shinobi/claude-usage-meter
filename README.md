@@ -149,6 +149,11 @@ account**, grouped by account with each session's tty and folder. Two actions:
 - **Stop them** stops the sessions without reopening.
 - **Just copy the resume commands** stops nothing at all.
 
+The helper scripts live in `bin/`, not in `menubar/`. SwiftBar's plugin directory
+is `menubar/`, so anything executable placed there is loaded as a plugin in its
+own right and its first line of output is painted into the menu bar — which is
+exactly what happened when `restart-stale-sessions.py` sat next to the plugin.
+
 A session listed in `protected-sessions` in the state dir (one id per line) is
 never stopped — put the session you are working in there, since the script can
 reopen a session but cannot undo stopping the one that was driving it.
