@@ -163,6 +163,8 @@ def title_image(parts):
 _BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin")
 SWITCH = os.path.join(_BIN, "switch-account.sh")
 RESTART = os.path.join(_BIN, "restart-stale-sessions.py")
+RESTART_ONE = os.path.join(_BIN, "restart-session-dialog.sh")
+COPY = os.path.join(_BIN, "copy-text.sh")
 
 state = get(BASE + "/api/state", 4)
 if not state:
@@ -271,6 +273,19 @@ if stale:
     print("--Stop them \u00b7 copy resume commands | bash=" + RESTART +
           " param1=--kill terminal=false refresh=true")
     print("--Just copy the resume commands | bash=" + RESTART + " terminal=false refresh=true")
+# Every live session with its id one click away, and a way to restart one by
+# id: a session started on an older account is put on the current one by a
+# restart (and comes back with Remote Control on), and the id is what names it.
+live = [x for x in (sess.get("sessions") or []) if x.get("sessionId")]
+if live:
+    print("\u25b8 " + str(len(live)) + " live session" + ("" if len(live) == 1 else "s") +
+          " \u00b7 copy an id | font=Menlo size=12")
+    for x in sorted(live, key=lambda x: ((x.get("email") or "~"), x.get("folder") or "")):
+        sid = x["sessionId"]
+        print("--" + sid[:8] + "\u2026 " + (x.get("folder") or "?")[:28].ljust(28) + " " +
+              (x.get("email") or "account unknown") + (" \u26a0" if x.get("stale") else "") +
+              " | bash=" + COPY + " param1=" + sid + " terminal=false font=Menlo size=11")
+print("\u27f3 Restart a session by ID\u2026 | bash=" + RESTART_ONE + " terminal=false refresh=true")
 print("Refresh now | refresh=true")
 # carry the token so the first click authorizes the browser; the server then
 # sets a cookie and redirects to the bare URL

@@ -26,6 +26,8 @@ if d.get("already"):
 n = d.get("stale") or 0
 tail = (" \u00b7 %d session%s still on the old account \u2014 restart from the menu"
         % (n, "" if n == 1 else "s")) if n else ""
+if d.get("reconnecting"):
+    tail += " \u00b7 reconnecting Remote Control in the running sessions"
 print("Now on " + str(d.get("active")) + tail)
 ')
 

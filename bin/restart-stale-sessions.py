@@ -10,8 +10,14 @@ back on the new account.
   restart-stale-sessions.py              report only
   restart-stale-sessions.py --kill       terminate them, then emit the commands
   restart-stale-sessions.py --relaunch   terminate them and reopen each one
+  restart-stale-sessions.py --relaunch --session <id>
+                                         one live session by id, stale or not —
+                                         the menu's "Restart a session by ID…"
 """
 import glob, json, os, re, shlex, shutil, subprocess, sys, time, urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fredrin_env
 
 BASE = "http://127.0.0.1:4177"
 STATE = os.environ.get("CLAUDE_USAGE_HOME") or os.path.join(
@@ -256,6 +262,9 @@ def reopen(cmd, name):
 def main():
     relaunch = "--relaunch" in sys.argv
     kill = "--kill" in sys.argv or relaunch
+    only = None
+    if "--session" in sys.argv and sys.argv.index("--session") + 1 < len(sys.argv):
+        only = sys.argv[sys.argv.index("--session") + 1].strip()
     d = api("/api/sessions")
     if d is None:
         notify("Can't reach the usage server")
@@ -271,6 +280,19 @@ def main():
         pass
 
     stale = [s for s in (d.get("sessions") or []) if s.get("stale")]
+    if only:
+        # An explicit id is a deliberate ask: any live session, on any account,
+        # and the protected list does not apply.
+        stale = [s for s in (d.get("sessions") or []) if s.get("sessionId") == only]
+        if not stale:
+            notify("No live Claude session has the id " + only[:8] + "…")
+            return 1
+        protected = set()
+    # SwiftBar has none of the FREDRIN_* environment the CLI needs, so borrow it
+    # from a running Fredrin-spawned process — otherwise every `fredrin` call
+    # below fails with "missing env" and no pane can be found or reopened.
+    if not fredrin_env.apply([s.get("pid") for s in stale if s.get("pid")]):
+        print("# no Fredrin environment found on this machine — panes cannot be reached")
     skipped = [s for s in stale if s.get("sessionId") in protected]
     stale = [s for s in stale if s.get("sessionId") not in protected]
     # A ticket Worker lives in Fredrin's Worker surface, which the terminals API
@@ -279,12 +301,16 @@ def main():
     workers = [s for s in stale if "/.fredrin/worktrees/" in (s.get("cwd") or "")]
     stale = [s for s in stale if s not in workers]
     if workers:
-        print("# ticket Workers — redispatched through Fredrin so the ticket keeps its "
-              "Worker: %s" % ", ".join((w.get("folder") or "?") for w in workers))
+        print("# ticket Workers — %s: %s"
+              % ("redispatched through Fredrin so the ticket keeps its Worker" if relaunch
+                 else "reported only, --relaunch redispatches them",
+                 ", ".join((w.get("folder") or "?") for w in workers)))
     if skipped:
         print("# protected, left running: %s" %
               ", ".join((s.get("tty") or "?") + " " + (s.get("folder") or "") for s in skipped))
-    if not stale:
+    # Workers are restarted further down, so having only those is still work to
+    # do — returning here would print "redispatched" and redispatch nothing.
+    if not stale and not (relaunch and workers):
         notify("No sessions to restart%s" % (" (%d protected)" % len(skipped) if skipped else ""))
         return 0
 
@@ -299,24 +325,39 @@ def main():
             lines.append("# %s (%s): no session id recorded — start it manually in %s" %
                          (s.get("tty"), s.get("email"), cwd))
     body = "\n".join(lines) + "\n"
-    try:
-        with open(RESUME_FILE, "w") as f:
-            f.write(body)
-        os.chmod(RESUME_FILE, 0o700)
-    except Exception:
-        pass
-    subprocess.run(["/usr/bin/pbcopy"], input=body.encode(), capture_output=True)
+    # Only when there is something to resume: a Worker-only run has no resume
+    # lines, and copying the empty header would wipe whatever is on the
+    # clipboard for nothing.
+    if stale:
+        try:
+            with open(RESUME_FILE, "w") as f:
+                f.write(body)
+            os.chmod(RESUME_FILE, 0o700)
+        except Exception:
+            pass
+        subprocess.run(["/usr/bin/pbcopy"], input=body.encode(), capture_output=True)
 
     if not kill:
         print(body, end="")
         notify("%d session(s) on another account · commands copied" % len(stale))
         return 0
 
+    # Each claude process carries FREDRIN_TERM_ID in its environment, naming
+    # its pane outright. The scrollback scan below is only the fallback for a
+    # session without it, and is skipped entirely when none needs it.
+    own_pane = {s.get("pid"): fredrin_env.proc_env(s.get("pid")).get("FREDRIN_TERM_ID")
+                for s in stale} if relaunch else {}
+    if relaunch:
+        live_panes = set(re.findall(r"term-[0-9a-f-]+", subprocess.run(
+            ["fredrin", "terminals", "list"], capture_output=True, text=True, timeout=15).stdout)) \
+            if shutil.which("fredrin") else set()
+        own_pane = {pid: p for pid, p in own_pane.items() if p in live_panes}
     # Read the pane map before killing anything: a dead session's pane still
     # shows the command line it launched with, but the argv match needs the
     # process alive.
-    panes, pane_cwds = fredrin_panes() if relaunch else ({}, {})
-    launch_ids = {s.get("pid"): launch_id(s.get("pid")) for s in stale} if relaunch else {}
+    need_scan = relaunch and any(s.get("pid") not in own_pane for s in stale)
+    panes, pane_cwds = fredrin_panes() if need_scan else ({}, {})
+    launch_ids = {s.get("pid"): launch_id(s.get("pid")) for s in stale} if need_scan else {}
     # argv has to be read while the process is alive, and a bare `claude --resume`
     # would drop the flags Fredrin launches its panes with — its hooks settings and
     # plugin dir — leaving a session that no longer talks to Fredrin.
@@ -327,7 +368,7 @@ def main():
     # interrupted through that pane before it is stopped.
     pane_for, used = {}, set()
     for s in stale:
-        pane = panes.get(launch_ids.get(s.get("pid")))
+        pane = own_pane.get(s.get("pid")) or panes.get(launch_ids.get(s.get("pid")))
         if not pane:
             hits = [p for p, c in pane_cwds.items()
                     if c == (s.get("cwd") or "") and p not in panes.values() and p not in used]
@@ -360,6 +401,7 @@ def main():
     # redispatch them itself: `tickets start` resumes the ticket's session and
     # keeps the association the ticket is tracked by. Only with --relaunch —
     # otherwise a Worker is reported and left alone.
+    worker_restarts = 0
     if relaunch:
         for w in workers:
             cwd, sid, pid = w.get("cwd") or "", w.get("sessionId"), w.get("pid")
@@ -386,11 +428,15 @@ def main():
             try:
                 subprocess.run(["fredrin", "sessions", "send", fsid, cmd],
                                capture_output=True, timeout=30)
+                worker_restarts += 1
                 print("# %s: restarted in its own Worker pane" % (w.get("folder") or "?"))
             except Exception:
                 print("# %s: restart failed — start it from Fredrin" % (w.get("folder") or "?"))
 
     opened, how = 0, set()
+    opened += worker_restarts
+    if worker_restarts:
+        how.add("its own Worker pane")
     for s in stale:
         sid, cwd = s.get("sessionId"), s.get("cwd") or os.path.expanduser("~")
         if not sid:
@@ -430,8 +476,9 @@ def main():
             print("# %s: stopped, but no Fredrin tab could be opened (is the Terminals "
                   "panel open?) — its resume command is on the clipboard"
                   % (s.get("folder") or s.get("tty") or "?"))
-    notify("Stopped %d · reopened %d via %s · commands still on the clipboard"
-           % (killed, opened, "/".join(sorted(how)) or "nothing"))
+    notify("Stopped %d · reopened %d via %s%s"
+           % (killed, opened, "/".join(sorted(how)) or "nothing",
+              " · commands still on the clipboard" if stale else ""))
     return 0
 
 

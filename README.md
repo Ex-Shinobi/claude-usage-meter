@@ -149,6 +149,26 @@ account**, grouped by account with each session's tty and folder. Two actions:
 - **Stop them** stops the sessions without reopening.
 - **Just copy the resume commands** stops nothing at all.
 
+Below that, **▸ N live sessions · copy an id** lists every running session
+(id prefix, folder, account, ⚠ when it is on another account); clicking a row
+copies its full session id. **⟳ Restart a session by ID…** asks for an id in a
+dialog (pre-filled from the clipboard when that holds one) and restarts just
+that session the same way — stopped, then resumed in its own Fredrin pane — so
+it comes back on the account the Mac is on now, with Remote Control on. Any
+live session qualifies, stale or not, and the protected list is not consulted:
+pasting an id is deliberate. It runs `restart-stale-sessions.py --relaunch
+--session <id>`.
+
+Both scripts run from the menu, and SwiftBar's environment has none of the
+`FREDRIN_*` variables the `fredrin` CLI needs (API address, tokens, the
+terminals server, the broker socket — they exist only in shells Fredrin
+spawned), so each first borrows them from a running Fredrin-spawned process via
+`bin/fredrin_env.py`. Without that, every `fredrin` call from the menu failed
+with "missing env" and a restart could stop sessions but never reopen them.
+A restart also no longer has to scan scrollback to find a session's pane: the
+claude process carries `FREDRIN_TERM_ID` in its environment, which names the
+pane outright, and the scrollback match is only the fallback.
+
 The helper scripts live in `bin/`, not in `menubar/`. SwiftBar's plugin directory
 is `menubar/`, so anything executable placed there is loaded as a plugin in its
 own right and its first line of output is painted into the menu bar — which is
@@ -161,6 +181,56 @@ reopen a session but cannot undo stopping the one that was driving it.
 All three put the resume lines on the clipboard and in `resume-stale-sessions.sh`
 in the state dir. Don't run that file directly — it would launch every session
 sequentially in one terminal, each blocking the next.
+
+### Remote Control after a switch
+
+A switch also drops **Remote Control** in every running session: each one
+prints "Remote Control disconnected — signed-in claude.ai account or
+organization changed on this machine — run /remote-control", and until someone
+types that, the session is unreachable from the phone or claude.ai/code.
+
+So after every successful switch, whichever surface triggered it, the server
+starts `bin/reconnect-remote-control.py` in the background. It types
+`/remote-control`, then ESC (closes the slash-command picker — and ends a
+running turn, so the command is not left queued behind it), then Enter into
+every live session, through the pane Fredrin owns for it:
+
+- a **terminal tab**: the claude process carries `FREDRIN_TERM_ID` in its
+  environment, which names its pane outright — no scrollback matching;
+- a **ticket Worker**: the broker session owning its worktree, via
+  `fredrin sessions send`, or its ticket via `fredrin tickets send` when a
+  paired fredrin-agent runs it;
+- anything else (cmux, Terminal.app) has no channel and is only named in the
+  notification.
+
+It waits until the switch is 35 seconds old first: Claude Code reads the
+Keychain through a 30-second cache, and `/remote-control` typed inside that
+window comes up on the *old* token and drops again. Then it reads each
+session's transcript for the `/remote-control is active` line Claude Code logs,
+and the notification counts only sessions that confirmed. The full report is in
+`reconnect-remote-control.log` in the state dir.
+
+Every session gets it, whatever account it started on: `/remote-control`
+opens the bridge under the account in the Keychain *now*, and it holds — a
+session started on one account, with the Mac switched to another, reconnected
+under the new account and stayed up. Only the session's own API calls stay on
+the account it started with; the notification counts those, and the menu's
+**Restart them** is what moves them (a restarted session comes back with
+Remote Control on by itself, via `remoteControlAtStartup` in
+`~/.claude/settings.json`).
+
+The `fredrin` CLI only works from a shell Fredrin spawned — its API address and
+tokens exist nowhere but that shell's environment — and neither launchd nor
+SwiftBar has them. The script borrows them from the environment of a running
+Fredrin-spawned process (`ps -E` shows a process's environment to its own user).
+
+To run it by hand:
+
+```bash
+bin/reconnect-remote-control.py --dry-run          # which channel each session would use
+bin/reconnect-remote-control.py --delay 0          # type right now
+bin/reconnect-remote-control.py --session <id>     # one session only
+```
 
 The switch replaces `claudeAiOauth` in the Keychain item and the `oauthAccount`
 key in `~/.claude.json`. It deliberately leaves the rest of the Keychain blob

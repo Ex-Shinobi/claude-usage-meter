@@ -26,7 +26,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
-const { execFileSync } = require("child_process");
+const { execFileSync, spawn } = require("child_process");
 
 const HOME = os.homedir();
 const CRED_FILE = path.join(HOME, ".claude", ".credentials.json");
@@ -245,6 +245,22 @@ async function switchTo(slug) {
   // how many were left behind rather than implying the switch reached them.
   const stale = listSessions().filter((x) => x.stale).length;
   return { active: target.label, identity, sessions, stale };
+}
+
+// A switch drops Remote Control in every running session ("signed-in account
+// changed — run /remote-control"). The helper types that command into every
+// session through its Fredrin pane; it waits out Claude Code's Keychain cache
+// first, so it runs detached rather than holding the switch response.
+function reconnectRemoteControl() {
+  const script = path.join(__dirname, "bin", "reconnect-remote-control.py");
+  try {
+    const child = spawn("/usr/bin/python3", [script], {
+      detached: true, stdio: "ignore",
+      env: { ...process.env, SWITCHED_AT: String(Date.now()) },
+    });
+    child.unref();
+    return true;
+  } catch (e) { console.error("remote-control reconnect:", e); return false; }
 }
 
 // ---------- live sessions ----------
@@ -540,7 +556,11 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/api/switch") {
       const slug = url.searchParams.get("slug");
       if (!slug) return send(res, 400, { ok: false, error: "missing slug" });
-      try { return send(res, 200, { ok: true, ...(await switchTo(slug)) }); }
+      try {
+        const r = await switchTo(slug);
+        if (!r.already) r.reconnecting = reconnectRemoteControl();
+        return send(res, 200, { ok: true, ...r });
+      }
       catch (e) { console.error("switch " + slug + ":", e); return send(res, 200, { ok: false, error: safeErr(e) }); }
     }
     if (req.method === "GET" && url.pathname === "/api/sessions") { return send(res, 200, { sessions: listSessions() }); }
