@@ -210,6 +210,20 @@ session's transcript for the `/remote-control is active` line Claude Code logs,
 and the notification counts only sessions that confirmed. The full report is in
 `reconnect-remote-control.log` in the state dir.
 
+The ESC costs a session that was mid-turn the turn it was running, so those
+sessions are then told to carry on. Just before typing into a session, the
+script reads `status` from its `~/.claude/sessions/<pid>.json`; if that says
+`busy`, then once the session's Remote Control reports active (plus a second
+for the TUI to settle) it types `resume` and Enter through the same channel.
+A mid-turn session that never confirms within the 20-second wait still gets
+`resume` at the end, so its work is not left interrupted. Only `busy` counts:
+`waiting` (a dialog or permission prompt is open), `idle` and `shell` (idle
+with a background shell running) get nothing extra, since `resume` in a session
+with no turn running would start one nobody asked for. Sessions left alone
+because Remote Control was already on, and sessions with no Fredrin channel,
+are not touched at all. The notification adds "resumed N", and a `resume` that
+cannot be typed is logged without changing the Remote Control counts.
+
 Every session gets it, whatever account it started on: `/remote-control`
 opens the bridge under the account in the Keychain *now*, and it holds — a
 session started on one account, with the Mac switched to another, reconnected
@@ -227,7 +241,7 @@ Fredrin-spawned process (`ps -E` shows a process's environment to its own user).
 To run it by hand:
 
 ```bash
-bin/reconnect-remote-control.py --dry-run          # which channel each session would use
+bin/reconnect-remote-control.py --dry-run          # which channel each session would use, and which are mid-turn
 bin/reconnect-remote-control.py --delay 0          # type right now
 bin/reconnect-remote-control.py --session <id>     # one session only
 ```

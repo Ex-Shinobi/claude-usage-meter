@@ -21,6 +21,14 @@ owns for it:
                          turn, so the command is not left queued behind it)
     Enter                submits the command
 
+The ESC costs a session that was mid-turn the turn it was running. So a session
+whose status file said "busy" just before its keystrokes went in also gets,
+through the same channel, once its Remote Control reports active (or, if it
+never does, once the wait for that is over):
+
+    resume               typed without Enter
+    Enter                submits it, so the interrupted work carries on
+
 Delivery channels, in order of preference:
   - a Fredrin terminal tab: the claude process carries FREDRIN_TERM_ID in its
     environment, which names its pane outright — no scrollback matching.
@@ -42,7 +50,8 @@ again moments later, so the script waits until the switch is 35 seconds old
 (SWITCHED_AT, ms since the epoch, set by the server; --delay N overrides).
 
   reconnect-remote-control.py             reconnect every live session
-  reconnect-remote-control.py --dry-run   show which channel each would use
+  reconnect-remote-control.py --dry-run   show which channel each would use,
+                                          and which would get "resume"
   reconnect-remote-control.py --session <id>   one session only
   reconnect-remote-control.py --delay 0   type right away
 """
@@ -59,6 +68,11 @@ UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 KEYCHAIN_CACHE_S = 30.0          # Claude Code's Keychain read cache
 DEFAULT_DELAY_S = KEYCHAIN_CACHE_S + 5
 KEY_GAP_S = 0.4                  # let the TUI draw the picker before ESC lands
+# The bridge_status line is appended to the transcript as the bridge comes up,
+# which can be before the TUI has finished redrawing around the status message.
+# Text typed during that redraw can land before the prompt is ready for it, so
+# "resume" waits this long past the confirmation.
+RESUME_SETTLE_S = 1.0
 
 _log = []
 
@@ -127,22 +141,33 @@ class Fredrin:
         except Exception:
             return None
 
+    def send(self, *args):
+        """One `fredrin ... send`, raising on failure, then a pause for the TUI."""
+        r = self.run(*args)
+        if r.returncode != 0:
+            raise RuntimeError((r.stderr or r.stdout).strip() or "send failed")
+        time.sleep(KEY_GAP_S)
+
     def keys_to_pane(self, pane):
         for text in ("/remote-control", "\x1b", "\r"):
-            r = self.run("terminals", "send", pane, text, "--no-enter")
-            if r.returncode != 0:
-                raise RuntimeError((r.stderr or r.stdout).strip() or "send failed")
-            time.sleep(KEY_GAP_S)
+            self.send("terminals", "send", pane, text, "--no-enter")
 
     def keys_to_session(self, fsid, verb="sessions"):
         # --interrupt is the broker's own ESC; "\r" raw is a bare Enter. The
         # same flags travel through `tickets send` for a Worker on a paired
         # machine, where the server composes the bytes instead of the broker.
         for args in (("/remote-control", "--no-enter"), ("--interrupt",), ("\r", "--no-enter")):
-            r = self.run(verb, "send", fsid, *args)
-            if r.returncode != 0:
-                raise RuntimeError((r.stderr or r.stdout).strip() or "send failed")
-            time.sleep(KEY_GAP_S)
+            self.send(verb, "send", fsid, *args)
+
+    def resume(self, kind, target):
+        """Type "resume" and submit it through the channel the /remote-control
+        keystrokes went through: the text without Enter, then a bare Enter,
+        exactly as those were sent."""
+        for text in ("resume", "\r"):
+            if kind == "pane":
+                self.send("terminals", "send", target, text, "--no-enter")
+            else:
+                self.send("tickets" if kind == "ticket" else "sessions", "send", target, text, "--no-enter")
 
 
 def transcript(sid):
@@ -181,15 +206,35 @@ def confirmed(sid, since):
     return False
 
 
+def session_file(pid):
+    """Claude Code's per-pid session file, ~/.claude/sessions/<pid>.json, or {}."""
+    try:
+        with open(os.path.expanduser("~/.claude/sessions/%d.json" % int(pid))) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
 def already_connected(pid):
     """Claude Code keeps its per-pid session file's bridgeSessionId set while
     Remote Control is up and clears it on disconnect. Typing /remote-control
     into a session that is already connected opens a dialog instead, and
     leaves the session sitting in it."""
-    try:
-        return bool(json.load(open(os.path.expanduser("~/.claude/sessions/%d.json" % int(pid)))).get("bridgeSessionId"))
-    except Exception:
-        return False
+    return bool(session_file(pid).get("bridgeSessionId"))
+
+
+def mid_turn(pid):
+    """Whether the session is running a turn, per the status in the same file.
+
+    Claude Code writes one of four values there: "busy" while a turn is loading,
+    "waiting" while a dialog, permission prompt or MCP input request is open,
+    "idle" at an empty prompt, and "shell" when idle with a background shell
+    still running. Only "busy" counts. A turn paused on a permission prompt
+    reads "waiting", but so does a dialog opened at an idle prompt, and the file
+    does not say which; "resume" typed into a session that had no turn running
+    would start one nobody asked for, so "waiting" is taken as not mid-turn.
+    """
+    return session_file(pid).get("status") == "busy"
 
 
 def wait_for_keychain(delay):
@@ -265,6 +310,8 @@ def main():
         for s, kind, target, label in plan:
             if already_connected(s["pid"]):
                 say("# %-28s Remote Control is on right now — would be left alone if still on at typing time" % label)
+            if kind and mid_turn(s["pid"]):
+                say("# %-28s mid-turn right now — would get \"resume\" after its /remote-control if still mid-turn at typing time" % label)
         return 0
 
     wait_for_keychain(delay)
@@ -279,8 +326,14 @@ def main():
     plan = [row for row in plan if row[0] not in connected]
 
     done, failed, unreachable = [], [], []
+    interrupted = []                             # rows that were mid-turn when their ESC went in
     sent_at = time.time()
-    for s, kind, target, label in plan:
+    for row in plan:
+        s, kind, target, label = row
+        # Read right before this session's keys, not at plan time: the Keychain
+        # wait and the sessions typed ahead of it are long enough for a turn to
+        # start or finish.
+        busy = kind is not None and mid_turn(s["pid"])
         try:
             if kind == "pane":
                 fr.keys_to_pane(target)
@@ -292,9 +345,35 @@ def main():
                 unreachable.append(label)
                 continue
             done.append(label)
+            if busy:
+                interrupted.append(row)
         except Exception as e:
             failed.append(label)
             say("# %s: could not type into it — %s" % (label, e))
+            if busy:
+                # Some of the keys may have landed, so /remote-control could be
+                # sitting in its prompt; "resume" typed now would be appended to it.
+                say("# %s: was mid-turn, so its turn may have been interrupted — resume not typed" % label)
+
+    # A session that was mid-turn lost that turn to the ESC and is owed a
+    # "resume". It is typed once the session's bridge reports active (and
+    # RESUME_SETTLE_S after that), so it does not land while /remote-control is
+    # still running.
+    owed = list(interrupted)
+    due = {}                                     # sessionId -> when its resume may be typed
+    resumed, not_resumed = [], []
+
+    def resume(row):
+        s, kind, target, label = row
+        owed.remove(row)
+        due.pop(s.get("sessionId"), None)
+        try:
+            fr.resume(kind, target)
+            resumed.append(label)
+            say("# %s: was mid-turn before the ESC — typed resume" % label)
+        except Exception as e:
+            not_resumed.append(label)
+            say("# %s: was mid-turn before the ESC, but resume could not be typed — %s" % (label, e))
 
     # Give each session a moment to bring the bridge up, then read the result
     # off its transcript. A session that never confirms is reported, since a
@@ -302,23 +381,41 @@ def main():
     typed = [(s, label) for s, kind, target, label in plan if label in done]
     end = time.time() + 20
     pending = {s.get("sessionId"): label for s, label in typed if s.get("sessionId")}
-    while pending and time.time() < end:
+    owed_sids = {row[0].get("sessionId") for row in owed if row[0].get("sessionId")}
+    while (pending or due) and time.time() < end:
         for sid in list(pending):
             r = confirmed(sid, sent_at)
             if r is None or r:
                 pending.pop(sid)
-        if pending:
+                if r and sid in owed_sids:
+                    due[sid] = time.time() + RESUME_SETTLE_S
+        for row in [row for row in owed if due.get(row[0].get("sessionId"), end + 1) <= time.time()]:
+            resume(row)
+        if pending or due:
             time.sleep(1.0)
     for sid, label in pending.items():
         done.remove(label)
         failed.append(label)
         say("# %s: typed, but the session never reported Remote Control active" % label)
 
+    # Whatever is still owed confirmed too late to be typed inside the window,
+    # never confirmed, or had no transcript to check. Its turn was interrupted
+    # either way, so it gets "resume" now rather than being left dead.
+    for row in list(owed):
+        wait = due.get(row[0].get("sessionId"), 0) - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        resume(row)
+
     parts = ["Remote Control back on in %d session%s" % (len(done), "" if len(done) == 1 else "s")]
+    if resumed:
+        parts.append("resumed %d" % len(resumed))
     if connected:
         parts.append("%d already on" % len(connected))
     if failed:
         parts.append("%d failed" % len(failed))
+    if not_resumed:
+        parts.append("%d could not be resumed" % len(not_resumed))
     if unreachable:
         parts.append("%d not in Fredrin (%s)" % (len(unreachable), ", ".join(unreachable[:3])))
     if stale:
