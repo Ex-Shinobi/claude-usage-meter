@@ -237,6 +237,33 @@ def mid_turn(pid):
     return session_file(pid).get("status") == "busy"
 
 
+def display_labels(sessions):
+    """Map each session's pid to the name its lines are printed under.
+
+    A session is recognisable by its folder, but the folder is not unique —
+    several live sessions genuinely sit in the same one. Only the printed name
+    has to tell them apart, since the bookkeeping keys off the pid, so a name
+    shared by more than one session takes a suffix and a name that stands alone
+    prints exactly as the folder does. The suffix is the tty where that
+    separates the whole group, because it says which window to look in, and the
+    pid otherwise, because that always separates them.
+    """
+    groups = {}
+    for s in sessions:
+        groups.setdefault(s.get("folder") or s.get("tty") or "?", []).append(s)
+    labels = {}
+    for name, group in groups.items():
+        ttys = [s.get("tty") for s in group]
+        for s in group:
+            if len(group) == 1:
+                labels[s["pid"]] = name
+            elif s.get("tty") and ttys.count(s["tty"]) == 1:
+                labels[s["pid"]] = "%s %s" % (name, s["tty"])
+            else:
+                labels[s["pid"]] = "%s pid %s" % (name, s["pid"])
+    return labels
+
+
 def wait_for_keychain(delay):
     """Hold until the switch is older than the Keychain cache."""
     try:
@@ -288,9 +315,12 @@ def main():
         say("# no Fredrin terminal environment found on this machine")
 
     # Resolve every channel up front, while nothing has been typed anywhere.
+    # The label is for the reader only; every list below tracks sessions by pid,
+    # which the API guarantees is present and unique where the label is neither.
+    labels = display_labels(sessions)
     plan = []
     for s in sessions:
-        cwd, label = s.get("cwd") or "", s.get("folder") or s.get("tty") or "?"
+        cwd, label = s.get("cwd") or "", labels[s["pid"]]
         pane = proc_env(s["pid"]).get("FREDRIN_TERM_ID")
         if pane and pane in panes:
             plan.append((s, "pane", pane, label))
@@ -320,12 +350,13 @@ def main():
     # session's file still says connected — it takes it a second or two to
     # notice the account change and drop the bridge — so checking before the
     # wait skipped exactly the sessions the switch had just disconnected.
-    connected = [s for s, kind, target, label in plan if already_connected(s["pid"])]
-    for s in connected:
-        say("# %-28s Remote Control already on — left alone" % (s.get("folder") or s.get("tty") or "?"))
-    plan = [row for row in plan if row[0] not in connected]
+    connected = [row for row in plan if already_connected(row[0]["pid"])]
+    for s, kind, target, label in connected:
+        say("# %-28s Remote Control already on — left alone" % label)
+    left_alone = {row[0]["pid"] for row in connected}
+    plan = [row for row in plan if row[0]["pid"] not in left_alone]
 
-    done, failed, unreachable = [], [], []
+    done, failed, unreachable = [], [], []       # pids, not labels: labels repeat
     interrupted = []                             # rows that were mid-turn when their ESC went in
     sent_at = time.time()
     for row in plan:
@@ -342,13 +373,13 @@ def main():
             elif kind == "ticket":
                 fr.keys_to_session(target, verb="tickets")
             else:
-                unreachable.append(label)
+                unreachable.append(s["pid"])
                 continue
-            done.append(label)
+            done.append(s["pid"])
             if busy:
                 interrupted.append(row)
         except Exception as e:
-            failed.append(label)
+            failed.append(s["pid"])
             say("# %s: could not type into it — %s" % (label, e))
             if busy:
                 # Some of the keys may have landed, so /remote-control could be
@@ -360,49 +391,51 @@ def main():
     # RESUME_SETTLE_S after that), so it does not land while /remote-control is
     # still running.
     owed = list(interrupted)
-    due = {}                                     # sessionId -> when its resume may be typed
+    due = {}                                     # pid -> when its resume may be typed
     resumed, not_resumed = [], []
 
     def resume(row):
         s, kind, target, label = row
         owed.remove(row)
-        due.pop(s.get("sessionId"), None)
+        due.pop(s["pid"], None)
         try:
             fr.resume(kind, target)
-            resumed.append(label)
+            resumed.append(s["pid"])
             say("# %s: was mid-turn before the ESC — typed resume" % label)
         except Exception as e:
-            not_resumed.append(label)
+            not_resumed.append(s["pid"])
             say("# %s: was mid-turn before the ESC, but resume could not be typed — %s" % (label, e))
 
     # Give each session a moment to bring the bridge up, then read the result
     # off its transcript. A session that never confirms is reported, since a
     # keystroke accepted by the PTY says nothing about what the TUI did with it.
-    typed = [(s, label) for s, kind, target, label in plan if label in done]
+    # A session with no sessionId has no transcript to read, so it is not waited
+    # on and its keystrokes stand as sent.
     end = time.time() + 20
-    pending = {s.get("sessionId"): label for s, label in typed if s.get("sessionId")}
-    owed_sids = {row[0].get("sessionId") for row in owed if row[0].get("sessionId")}
+    pending = {s["pid"]: s["sessionId"] for s, kind, target, label in plan
+               if s["pid"] in done and s.get("sessionId")}
+    owed_pids = {row[0]["pid"] for row in owed}
     while (pending or due) and time.time() < end:
-        for sid in list(pending):
+        for pid, sid in list(pending.items()):
             r = confirmed(sid, sent_at)
             if r is None or r:
-                pending.pop(sid)
-                if r and sid in owed_sids:
-                    due[sid] = time.time() + RESUME_SETTLE_S
-        for row in [row for row in owed if due.get(row[0].get("sessionId"), end + 1) <= time.time()]:
+                pending.pop(pid)
+                if r and pid in owed_pids:
+                    due[pid] = time.time() + RESUME_SETTLE_S
+        for row in [row for row in owed if due.get(row[0]["pid"], end + 1) <= time.time()]:
             resume(row)
         if pending or due:
             time.sleep(1.0)
-    for sid, label in pending.items():
-        done.remove(label)
-        failed.append(label)
-        say("# %s: typed, but the session never reported Remote Control active" % label)
+    for pid in pending:
+        done.remove(pid)
+        failed.append(pid)
+        say("# %s: typed, but the session never reported Remote Control active" % labels[pid])
 
     # Whatever is still owed confirmed too late to be typed inside the window,
     # never confirmed, or had no transcript to check. Its turn was interrupted
     # either way, so it gets "resume" now rather than being left dead.
     for row in list(owed):
-        wait = due.get(row[0].get("sessionId"), 0) - time.time()
+        wait = due.get(row[0]["pid"], 0) - time.time()
         if wait > 0:
             time.sleep(wait)
         resume(row)
@@ -417,7 +450,8 @@ def main():
     if not_resumed:
         parts.append("%d could not be resumed" % len(not_resumed))
     if unreachable:
-        parts.append("%d not in Fredrin (%s)" % (len(unreachable), ", ".join(unreachable[:3])))
+        parts.append("%d not in Fredrin (%s)" % (len(unreachable),
+                                                 ", ".join(labels[pid] for pid in unreachable[:3])))
     if stale:
         parts.append("%d still run on the old account — Restart them from the menu to move them" % len(stale))
     say("# " + " · ".join(parts))
