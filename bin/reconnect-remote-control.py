@@ -21,13 +21,23 @@ owns for it:
                          turn, so the command is not left queued behind it)
     Enter                submits the command
 
-The ESC costs a session that was mid-turn the turn it was running. So a session
-whose status file said "busy" just before its keystrokes went in also gets,
-through the same channel, once its Remote Control reports active (or, if it
-never does, once the wait for that is over):
+Every session those keystrokes went into cleanly then also gets, through the
+same channel, once its Remote Control reports active (or, if it never does,
+once the wait for that is over):
 
     resume               typed without Enter
     Enter                submits it, so the interrupted work carries on
+
+Every session, because by the time anything can be typed the work is stopped
+either way: the switch itself kills a turn in flight (its API call loses
+authorization, or the account was switched *because* the old one ran out of
+quota, which had already killed the turn), and the ESC kills whatever survived
+that. The live status in ~/.claude/sessions/<pid>.json used to decide this and
+could not: it is read ~35 seconds after the switch, long after a killed turn
+has gone back to "idle", and some sessions leave it stale for hours. A session
+that was genuinely idle loses nothing it minds — "resume" at an idle prompt
+picks the last turn back up — while a session left unresumed sits dead until a
+human notices.
 
 Delivery channels, in order of preference:
   - a Fredrin terminal tab: the claude process carries FREDRIN_TERM_ID in its
@@ -223,20 +233,6 @@ def already_connected(pid):
     return bool(session_file(pid).get("bridgeSessionId"))
 
 
-def mid_turn(pid):
-    """Whether the session is running a turn, per the status in the same file.
-
-    Claude Code writes one of four values there: "busy" while a turn is loading,
-    "waiting" while a dialog, permission prompt or MCP input request is open,
-    "idle" at an empty prompt, and "shell" when idle with a background shell
-    still running. Only "busy" counts. A turn paused on a permission prompt
-    reads "waiting", but so does a dialog opened at an idle prompt, and the file
-    does not say which; "resume" typed into a session that had no turn running
-    would start one nobody asked for, so "waiting" is taken as not mid-turn.
-    """
-    return session_file(pid).get("status") == "busy"
-
-
 def display_labels(sessions):
     """Map each session's pid to the name its lines are printed under.
 
@@ -340,8 +336,8 @@ def main():
         for s, kind, target, label in plan:
             if already_connected(s["pid"]):
                 say("# %-28s Remote Control is on right now — would be left alone if still on at typing time" % label)
-            if kind and mid_turn(s["pid"]):
-                say("# %-28s mid-turn right now — would get \"resume\" after its /remote-control if still mid-turn at typing time" % label)
+            elif kind:
+                say("# %-28s would get \"resume\" after its /remote-control" % label)
         return 0
 
     wait_for_keychain(delay)
@@ -357,14 +353,10 @@ def main():
     plan = [row for row in plan if row[0]["pid"] not in left_alone]
 
     done, failed, unreachable = [], [], []       # pids, not labels: labels repeat
-    interrupted = []                             # rows that were mid-turn when their ESC went in
+    typed = []                                   # rows whose keystrokes all went in
     sent_at = time.time()
     for row in plan:
         s, kind, target, label = row
-        # Read right before this session's keys, not at plan time: the Keychain
-        # wait and the sessions typed ahead of it are long enough for a turn to
-        # start or finish.
-        busy = kind is not None and mid_turn(s["pid"])
         try:
             if kind == "pane":
                 fr.keys_to_pane(target)
@@ -376,21 +368,20 @@ def main():
                 unreachable.append(s["pid"])
                 continue
             done.append(s["pid"])
-            if busy:
-                interrupted.append(row)
+            typed.append(row)
         except Exception as e:
             failed.append(s["pid"])
             say("# %s: could not type into it — %s" % (label, e))
-            if busy:
-                # Some of the keys may have landed, so /remote-control could be
-                # sitting in its prompt; "resume" typed now would be appended to it.
-                say("# %s: was mid-turn, so its turn may have been interrupted — resume not typed" % label)
+            # Some of the keys may have landed, so /remote-control could be
+            # sitting half-typed in its prompt; "resume" typed now would be
+            # appended to it rather than submitted on its own.
+            say("# %s: resume not typed — a half-typed command may be sitting in its prompt" % label)
 
-    # A session that was mid-turn lost that turn to the ESC and is owed a
-    # "resume". It is typed once the session's bridge reports active (and
-    # RESUME_SETTLE_S after that), so it does not land while /remote-control is
-    # still running.
-    owed = list(interrupted)
+    # Every session that took the keystrokes is owed a "resume": its turn was
+    # ended by the switch or by the ESC that followed it. The resume is typed
+    # once the session's bridge reports active (and RESUME_SETTLE_S after that),
+    # so it does not land while /remote-control is still running.
+    owed = list(typed)
     due = {}                                     # pid -> when its resume may be typed
     resumed, not_resumed = [], []
 
@@ -401,10 +392,10 @@ def main():
         try:
             fr.resume(kind, target)
             resumed.append(s["pid"])
-            say("# %s: was mid-turn before the ESC — typed resume" % label)
+            say("# %s: typed resume, so an interrupted turn carries on" % label)
         except Exception as e:
             not_resumed.append(s["pid"])
-            say("# %s: was mid-turn before the ESC, but resume could not be typed — %s" % (label, e))
+            say("# %s: resume could not be typed — %s" % (label, e))
 
     # Give each session a moment to bring the bridge up, then read the result
     # off its transcript. A session that never confirms is reported, since a
@@ -432,8 +423,8 @@ def main():
         say("# %s: typed, but the session never reported Remote Control active" % labels[pid])
 
     # Whatever is still owed confirmed too late to be typed inside the window,
-    # never confirmed, or had no transcript to check. Its turn was interrupted
-    # either way, so it gets "resume" now rather than being left dead.
+    # never confirmed, or had no transcript to check. Its turn was ended either
+    # way, so it gets "resume" now rather than being left dead.
     for row in list(owed):
         wait = due.get(row[0]["pid"], 0) - time.time()
         if wait > 0:
