@@ -13,20 +13,32 @@ itself started on (verified to hold). The session's own API calls still use
 the account it started with; the notification counts those, since only a
 restart from the menu moves them.
 
-For each session it sends three keystrokes, in order, through the pane Fredrin
-owns for it:
+How the command is typed depends on the channel, because only one of them
+carries raw bytes. A Fredrin terminal pane is a straight PTY write, so it gets
+the three keystrokes a human would type:
 
     /remote-control      typed without Enter
     ESC                  closes the slash-command picker (and ends a running
                          turn, so the command is not left queued behind it)
     Enter                submits the command
 
+The broker and ticket channels carry flags, not bytes. A body is delivered to
+the TUI as a bracketed paste, and a CR passed as payload text lands inside that
+paste, where the TUI swallows it as content: the command is left sitting unsent
+in the composer, and the next send is appended to it on a new line rather than
+replacing it. Submitting is a flag there, so it has to be sent as one — the ESC
+as `--interrupt`, then the body with no `--no-enter`, which makes the broker
+(or, for a ticket, the Fredrin server) type the CR as its own write 120ms after
+the body, outside the paste:
+
+    fredrin <sessions|tickets> send <target> --interrupt
+    fredrin <sessions|tickets> send <target> /remote-control
+
 Every session those keystrokes went into cleanly then also gets, through the
 same channel, once its Remote Control reports active (or, if it never does,
-once the wait for that is over):
-
-    resume               typed without Enter
-    Enter                submits it, so the interrupted work carries on
+once the wait for that is over), `resume`, so the interrupted work carries on:
+the text and then a bare Enter on a pane, and the one submitting send on the
+other two.
 
 Every session, because by the time anything can be typed the work is stopped
 either way: the switch itself kills a turn in flight (its API call loses
@@ -47,6 +59,20 @@ Delivery channels, in order of preference:
   - a Worker the local broker does not own (run by a paired fredrin-agent):
     its ticket, via `fredrin tickets send`, which goes through the Fredrin API.
   - anything else (cmux, Terminal.app): no channel — reported, not touched.
+
+Each one is checked before it is chosen, from a single `fredrin sessions list`:
+the pane has to still exist, the broker session has to be live rather than a
+hibernated or reapable one, and the ticket's Worker has to sit on a machine
+that is still checking in. A channel that is not credible falls through to the
+next, and a session left with none is reported rather than typed into — every
+`fredrin ... send` exits 0 on a write the TUI may never act on, so an exit code
+is not evidence that anything arrived. The transcript is (see confirmed()).
+
+"On other machines" in that listing usually means this one: a Worker the local
+fredrin-agent runs belongs to the agent's own broker, not the desktop app's, so
+the CLI can only reach it by ticket, through the Fredrin API and back. The name
+it is filed under is the hostname captured when the agent was paired, which
+drifts, so the log says when that machine is in fact this machine.
 
 The Fredrin terminals API and its token exist only in the environment of shells
 Fredrin spawned. This script is started by the usage server (launchd) or by
@@ -74,7 +100,6 @@ BASE = "http://127.0.0.1:4177"
 STATE = os.environ.get("CLAUDE_USAGE_HOME") or os.path.join(
     os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "claude-usage-meter")
 LOG_FILE = os.path.join(STATE, "reconnect-remote-control.log")
-UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 KEYCHAIN_CACHE_S = 30.0          # Claude Code's Keychain read cache
 DEFAULT_DELAY_S = KEYCHAIN_CACHE_S + 5
 KEY_GAP_S = 0.4                  # let the TUI draw the picker before ESC lands
@@ -116,6 +141,7 @@ class Fredrin:
     def __init__(self, env):
         self.env = env
         self.bin = shutil.which("fredrin", path=env["PATH"]) or os.path.expanduser("~/.fredrin/bin/fredrin")
+        self._listing = None
 
     def run(self, *args, timeout=20):
         return subprocess.run([self.bin] + list(args), capture_output=True, text=True,
@@ -127,57 +153,102 @@ class Fredrin:
         except Exception:
             return set()
 
-    def session_for(self, cwd):
-        """The broker session owning a worktree — a path belongs to one ticket."""
+    def listing(self):
+        """`fredrin sessions list`, read once, as (by_cwd, by_ticket).
+
+        The listing has two halves, because there are two brokers. The local
+        half is one row per PTY the desktop app's broker spawned:
+
+            <marker> <sessionId>  <ticketId>  <state>  <cwd>
+
+        where the marker is "●" live, "💤" hibernated (idle-swept) or "✗" a
+        reapable zombie — only a live one can be typed into. The remote half,
+        under an "-- on other machines --" header, is one row per Worker some
+        other broker owns, this machine's own fredrin-agent included:
+
+            <marker> <jobId>  <ticketRef>  <machine>  <machineSource>  <status>
+
+        where "●" means that machine is still checking in and "○" that it has
+        gone quiet. Those rows are addressed by ticket, never by session id.
+
+        Parsed here rather than at each call site so the whole plan is built
+        from one snapshot, and one subprocess.
+        """
+        if self._listing is not None:
+            return self._listing
+        by_cwd, by_ticket, remote = {}, {}, False
         try:
             out = self.run("sessions", "list").stdout
         except Exception:
-            return None
+            out = ""
         for line in out.splitlines():
-            if line.rstrip().endswith(cwd.rstrip("/")):
-                m = re.search(r"(" + UUID + ")", line)
-                if m:
-                    return m.group(1)
-        return None
-
-    def ticket_for(self, cwd):
-        """A worktree is named <project>.<TICKET-IDENT>; confirmed against the API."""
-        base = os.path.basename(cwd.rstrip("/"))
-        ident = base.rsplit(".", 1)[-1] if "." in base else None
-        if not ident:
-            return None
-        try:
-            return ident if json.loads(self.run("tickets", "get", ident).stdout).get("ok") else None
-        except Exception:
-            return None
+            if line.startswith("-- on other machines"):
+                remote = True
+                continue
+            fields = line.split(None, 5 if remote else 4)
+            if len(fields) < (6 if remote else 5) or fields[0] not in ("●", "○", "💤", "✗"):
+                continue
+            if remote:
+                by_ticket[fields[2]] = {"marker": fields[0], "machine": fields[3],
+                                        "where": fields[4], "status": fields[5],
+                                        "online": fields[0] == "●"}
+            else:
+                # A cwd belongs to one ticket, so it identifies the row. The
+                # marker, not the state word, says whether it can take input:
+                # the state of a live session is its lifecycle (running,
+                # needsInput, …), which is never a reason to skip it.
+                by_cwd[fields[4].rstrip("/")] = {"marker": fields[0], "sessionId": fields[1],
+                                                 "state": fields[3], "live": fields[0] == "●"}
+        self._listing = (by_cwd, by_ticket)
+        return self._listing
 
     def send(self, *args):
-        """One `fredrin ... send`, raising on failure, then a pause for the TUI."""
+        """One `fredrin ... send`, raising on failure, then a pause for the TUI.
+
+        A zero exit says the write was accepted, not that the TUI acted on it —
+        on the ticket channel it says only that the Fredrin API published the
+        event. Delivery is confirmed from the transcript instead.
+        """
         r = self.run(*args)
         if r.returncode != 0:
             raise RuntimeError((r.stderr or r.stdout).strip() or "send failed")
         time.sleep(KEY_GAP_S)
 
     def keys_to_pane(self, pane):
+        """A pane is a raw PTY write, so the bytes a human would type land as
+        typed: the command, the ESC that closes the picker, then the Enter."""
         for text in ("/remote-control", "\x1b", "\r"):
             self.send("terminals", "send", pane, text, "--no-enter")
 
     def keys_to_session(self, fsid, verb="sessions"):
-        # --interrupt is the broker's own ESC; "\r" raw is a bare Enter. The
-        # same flags travel through `tickets send` for a Worker on a paired
-        # machine, where the server composes the bytes instead of the broker.
-        for args in (("/remote-control", "--no-enter"), ("--interrupt",), ("\r", "--no-enter")):
-            self.send(verb, "send", fsid, *args)
+        """The broker and the ticket channel take flags, not bytes.
+
+        A body goes to the TUI as a bracketed paste. A CR handed over as
+        payload text ("\\r" with --no-enter, which is what a bare Enter looks
+        like here) lands inside that paste and is swallowed as content, so the
+        command sits unsent in the composer and the next send is appended to it
+        on a new line — observed on a Worker that collected "/remote-control",
+        "resume" and a later probe in its composer across two runs, and
+        submitted all three at once when something finally pressed Enter.
+
+        So the submit is expressed as the flag it is: --interrupt for the ESC,
+        on its own, then the body with Enter left on, which has the broker (or,
+        for a ticket, the server) type the CR as its own write 120ms after the
+        body. The picker never opens, because a paste does not open it, and the
+        command is submitted straight from the composer.
+        """
+        self.send(verb, "send", fsid, "--interrupt")
+        self.send(verb, "send", fsid, "/remote-control")
 
     def resume(self, kind, target):
         """Type "resume" and submit it through the channel the /remote-control
-        keystrokes went through: the text without Enter, then a bare Enter,
-        exactly as those were sent."""
-        for text in ("resume", "\r"):
-            if kind == "pane":
+        keystrokes went through, in that channel's own shape: the text and then
+        a bare Enter on a pane, one submitting send everywhere else."""
+        if kind == "pane":
+            for text in ("resume", "\r"):
                 self.send("terminals", "send", target, text, "--no-enter")
-            else:
-                self.send("tickets" if kind == "ticket" else "sessions", "send", target, text, "--no-enter")
+        else:
+            self.send("tickets" if kind == "ticket" else "sessions", "send", target, "resume")
 
 
 def transcript(sid):
@@ -214,6 +285,31 @@ def confirmed(sid, since):
             continue
         return at >= since - 2
     return False
+
+
+def ticket_ident(cwd):
+    """The ticket a worktree belongs to: it is named <project>.<TICKET-IDENT>.
+
+    Matched against the listing's own ticket refs rather than guessed at, so an
+    older worktree named for a bare suffix simply finds nothing — typing into
+    the wrong session is the failure this whole check exists to avoid.
+    """
+    base = os.path.basename((cwd or "").rstrip("/"))
+    return base.rsplit(".", 1)[-1] if "." in base else None
+
+
+def this_machine():
+    """The name this machine's own fredrin-agent is paired under, if it has one.
+
+    It is the hostname captured when the agent was paired, so it drifts away
+    from the current one — which is why a Worker this very machine is running
+    turns up in the listing under "on other machines".
+    """
+    try:
+        with open(os.path.expanduser("~/.fredrin/agent.json")) as f:
+            return (json.load(f).get("name") or "").strip()
+    except Exception:
+        return ""
 
 
 def session_file(pid):
@@ -310,28 +406,48 @@ def main():
     if not fr.env.get("FREDRIN_TERM_API"):
         say("# no Fredrin terminal environment found on this machine")
 
-    # Resolve every channel up front, while nothing has been typed anywhere.
+    # Resolve every channel up front, while nothing has been typed anywhere, and
+    # from one snapshot of what Fredrin can still reach. A channel is only taken
+    # if the listing says it is credible: an exit code cannot tell a live TUI
+    # from a hibernated one, so the check has to happen before the send, not be
+    # inferred from it afterwards. Where the preferred channel is not credible
+    # the next one is tried, and a session left with none is reported.
     # The label is for the reader only; every list below tracks sessions by pid,
     # which the API guarantees is present and unique where the label is neither.
     labels = display_labels(sessions)
-    plan = []
+    by_cwd, by_ticket = fr.listing()
+    here = this_machine()
+    plan, notes = [], {}                         # notes: pid -> why, for the reader
     for s in sessions:
-        cwd, label = s.get("cwd") or "", labels[s["pid"]]
+        cwd, label = (s.get("cwd") or "").rstrip("/"), labels[s["pid"]]
         pane = proc_env(s["pid"]).get("FREDRIN_TERM_ID")
+        row = by_cwd.get(cwd)
+        remote = by_ticket.get(ticket_ident(cwd) or "\0")
         if pane and pane in panes:
             plan.append((s, "pane", pane, label))
-        elif "/.fredrin/worktrees/" in cwd and fr.session_for(cwd):
-            plan.append((s, "worker", fr.session_for(cwd), label))
-        elif "/.fredrin/" in cwd and fr.ticket_for(cwd):
-            plan.append((s, "ticket", fr.ticket_for(cwd), label))
+        elif row and row["live"]:
+            plan.append((s, "worker", row["sessionId"], label))
+        elif remote and remote["online"]:
+            plan.append((s, "ticket", ticket_ident(cwd), label))
+            if remote["machine"] and remote["machine"] == here:
+                notes[s["pid"]] = ("on %s, which is this machine's own fredrin-agent"
+                                   % remote["machine"])
+            else:
+                notes[s["pid"]] = "on %s" % (remote["machine"] or "another machine")
         else:
             plan.append((s, None, None, label))
+            if row:
+                notes[s["pid"]] = "its broker session is %s, so nothing typed would land" % row["state"]
+            elif remote:
+                notes[s["pid"]] = "its Worker's machine %s has gone quiet" % (remote["machine"] or "?")
 
     for s, kind, target, label in plan:
-        say("# %-28s %s" % (label, {"pane": "terminal tab " + str(target),
-                                     "worker": "Worker session " + str(target),
-                                     "ticket": "Worker on ticket " + str(target)}.get(
-                                         kind, "no Fredrin channel — run /remote-control there yourself")))
+        what = {"pane": "terminal tab " + str(target),
+                "worker": "Worker session " + str(target),
+                "ticket": "Worker on ticket " + str(target)}.get(
+                    kind, "no Fredrin channel — run /remote-control there yourself")
+        note = notes.get(s["pid"])
+        say("# %-28s %s%s" % (label, what, (" — " + note) if note else ""))
     if dry:
         for s, kind, target, label in plan:
             if already_connected(s["pid"]):
@@ -352,7 +468,13 @@ def main():
     left_alone = {row[0]["pid"] for row in connected}
     plan = [row for row in plan if row[0]["pid"] not in left_alone]
 
-    done, failed, unreachable = [], [], []       # pids, not labels: labels repeat
+    # Sessions are counted by what the transcript went on to say, not by what
+    # the sends returned: `done` is only the ones that logged Remote Control
+    # active, `unverified` the ones whose result could not be read at all, and
+    # `failed` the ones that were typed into and never reported it. Counting a
+    # zero exit as success is what let a Worker sit disconnected for two days
+    # while every run reported it reconnected.
+    done, failed, unreachable, unverified = [], [], [], []   # pids: labels repeat
     typed = []                                   # rows whose keystrokes all went in
     sent_at = time.time()
     for row in plan:
@@ -367,7 +489,6 @@ def main():
             else:
                 unreachable.append(s["pid"])
                 continue
-            done.append(s["pid"])
             typed.append(row)
         except Exception as e:
             failed.append(s["pid"])
@@ -400,25 +521,34 @@ def main():
     # Give each session a moment to bring the bridge up, then read the result
     # off its transcript. A session that never confirms is reported, since a
     # keystroke accepted by the PTY says nothing about what the TUI did with it.
-    # A session with no sessionId has no transcript to read, so it is not waited
-    # on and its keystrokes stand as sent.
+    # A session with no sessionId has no transcript to read at all, so it can
+    # only ever be unverified: its keystrokes went in and nothing can say more.
     end = time.time() + 20
-    pending = {s["pid"]: s["sessionId"] for s, kind, target, label in plan
-               if s["pid"] in done and s.get("sessionId")}
+    pending = {}
+    for s, kind, target, label in typed:
+        if s.get("sessionId"):
+            pending[s["pid"]] = s["sessionId"]
+        else:
+            unverified.append(s["pid"])
+            say("# %s: typed, but it has no transcript to confirm Remote Control from" % label)
     owed_pids = {row[0]["pid"] for row in owed}
     while (pending or due) and time.time() < end:
         for pid, sid in list(pending.items()):
             r = confirmed(sid, sent_at)
             if r is None or r:
                 pending.pop(pid)
-                if r and pid in owed_pids:
-                    due[pid] = time.time() + RESUME_SETTLE_S
+                if r:
+                    done.append(pid)
+                    if pid in owed_pids:
+                        due[pid] = time.time() + RESUME_SETTLE_S
+                else:
+                    unverified.append(pid)
+                    say("# %s: typed, but its transcript could not be read" % labels[pid])
         for row in [row for row in owed if due.get(row[0]["pid"], end + 1) <= time.time()]:
             resume(row)
         if pending or due:
             time.sleep(1.0)
     for pid in pending:
-        done.remove(pid)
         failed.append(pid)
         say("# %s: typed, but the session never reported Remote Control active" % labels[pid])
 
@@ -436,6 +566,8 @@ def main():
         parts.append("resumed %d" % len(resumed))
     if connected:
         parts.append("%d already on" % len(connected))
+    if unverified:
+        parts.append("%d unverified" % len(unverified))
     if failed:
         parts.append("%d failed" % len(failed))
     if not_resumed:

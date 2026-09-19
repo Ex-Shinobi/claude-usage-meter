@@ -190,35 +190,62 @@ organization changed on this machine — run /remote-control", and until someone
 types that, the session is unreachable from the phone or claude.ai/code.
 
 So after every successful switch, whichever surface triggered it, the server
-starts `bin/reconnect-remote-control.py` in the background. It types
-`/remote-control`, then ESC (closes the slash-command picker — and ends a
-running turn, so the command is not left queued behind it), then Enter into
-every live session, through the pane Fredrin owns for it:
+starts `bin/reconnect-remote-control.py` in the background. It runs
+`/remote-control` in every live session, through one of three channels:
 
 - a **terminal tab**: the claude process carries `FREDRIN_TERM_ID` in its
   environment, which names its pane outright — no scrollback matching;
 - a **ticket Worker**: the broker session owning its worktree, via
   `fredrin sessions send`, or its ticket via `fredrin tickets send` when a
-  paired fredrin-agent runs it;
+  fredrin-agent runs it;
 - anything else (cmux, Terminal.app) has no channel and is only named in the
   notification.
+
+**Only a pane takes the keystrokes a human would type.** There it writes
+`/remote-control`, then ESC (closes the slash-command picker — and ends a
+running turn, so the command is not left queued behind it), then Enter. The
+other two channels carry flags rather than bytes: the body reaches the TUI as a
+bracketed paste, and an Enter passed as payload text lands *inside* that paste,
+where the TUI swallows it as content. The command then sits unsent in the
+composer and the next send is appended to it on a new line — which is exactly
+how one Worker spent two days disconnected while every run reported it fixed,
+its composer quietly collecting `/remote-control` and `resume` until something
+finally pressed Enter and submitted all of it at once. So on those two channels
+the submit is sent as the flag it is: `--interrupt` for the ESC, on its own,
+then the body with Enter left on, which makes the broker (or, for a ticket, the
+Fredrin server) type the CR as its own write 120 ms later, outside the paste.
+
+**Each channel is checked before it is chosen**, from a single
+`fredrin sessions list`: the pane has to still exist, the broker session has to
+be live rather than hibernated or a reapable zombie, and a ticket's Worker has
+to sit on a machine that is still checking in. A channel that is not credible
+falls through to the next, and a session left with none is reported rather than
+typed into. "On other machines" in that listing usually means *this* one — a
+Worker the local fredrin-agent runs belongs to the agent's own broker, not the
+desktop app's, so it is only reachable by ticket, and it is filed under the
+hostname captured when the agent was paired, which drifts. The log says so when
+that machine is in fact this machine.
 
 It waits until the switch is 35 seconds old first: Claude Code reads the
 Keychain through a 30-second cache, and `/remote-control` typed inside that
 window comes up on the *old* token and drops again. Then it reads each
-session's transcript for the `/remote-control is active` line Claude Code logs,
-and the notification counts only sessions that confirmed. The full report is in
+session's transcript for the `/remote-control is active` line Claude Code logs.
+**Only that line counts as success.** Every `fredrin ... send` exits 0 on a
+write the TUI may never act on — on the ticket channel a zero exit means only
+that the Fredrin API published the event — so a session is reported
+`unverified` when its transcript cannot be read at all, and `failed` when it
+was typed into and never reported Remote Control active. The full report is in
 `reconnect-remote-control.log` in the state dir.
 
 **Every session it typed into is then told to carry on.** Once that session's
-Remote Control reports active (plus a second for the TUI to settle), it types
-`resume` and Enter through the same channel; a session that never confirms
-within the 20-second wait still gets `resume` at the end, so no work is left
-stopped. Sessions left alone because Remote Control was already on, and
-sessions with no Fredrin channel, get nothing — they were never typed into.
-Nor does a session whose keystrokes failed partway: `/remote-control` may be
-sitting half-typed in its prompt, and `resume` would be appended to it instead
-of submitted.
+Remote Control reports active (plus a second for the TUI to settle), it sends
+`resume` through the same channel, in that channel's own shape; a session that
+never confirms within the 20-second wait still gets `resume` at the end, so no
+work is left stopped. Sessions left alone because Remote Control was already
+on, and sessions with no credible channel, get nothing — they were never typed
+into. Nor does a session whose keystrokes failed partway: `/remote-control` may
+be sitting half-typed in its prompt, and `resume` would be appended to it
+instead of submitted.
 
 Every session, because by the time anything can be typed the turn is over
 either way. The switch kills a turn in flight — its API call loses
