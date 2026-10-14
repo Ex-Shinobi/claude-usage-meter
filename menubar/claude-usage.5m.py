@@ -2,7 +2,7 @@
 # SwiftBar plugin — Claude usage in the menu bar.
 #
 # Menu bar : a rendered image  ● I 35 · ● B 100 · ● G 100
-#            Each dot is independently colored by that account's Fable %
+#            Each dot is independently colored by that account's weekly %
 #            (SwiftBar's color= applies to a whole text line, so the title is
 #             drawn as a retina PNG to get per-dot colors.)
 # Dropdown : per-account ▰▱ segmented bars, %s, reset times.
@@ -72,12 +72,6 @@ def segbar(p):
     p = max(0, min(100, p))
     f = int(round(p / 10.0))
     return "▰" * f + "▱" * (10 - f)
-
-def fable(u):
-    for l in (u.get("limits") or []):
-        if str(l.get("scope") or "").lower().startswith("fable") and l.get("percent") is not None:
-            return l["percent"]
-    return None
 
 def title_image(parts):
     """parts = [(letter, text, level|'none'), ...] -> base64 PNG.
@@ -191,7 +185,7 @@ parts, text_fallback = [], []
 for a in accounts:
     u = usage.get(a["slug"])
     letter = ((a.get("email") or a.get("label") or "?")[:1]).upper()
-    fv = fable(u) if (u and u.get("ok")) else None
+    fv = u.get("sevenDay") if (u and u.get("ok")) else None
     if fv is None:
         parts.append((letter, "—", "none"))
         text_fallback.append("● " + letter + " —")
